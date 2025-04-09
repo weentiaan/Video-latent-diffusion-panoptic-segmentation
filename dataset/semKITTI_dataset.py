@@ -1,7 +1,14 @@
+import os
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torchvision.transforms as transforms
 class SemKITTI_DVPS_Dataset(Dataset):
-    def __init__(self, root, split='train',
-                 image_transform=None,
-                 GT_transform=None,
+    def __init__(self, root,
+                 image_transform,
+                 GT_transform,
+                 split='train',
                  ):
         """
         Args:
@@ -96,11 +103,11 @@ class SemKITTI_DVPS_Dataset(Dataset):
             image = transforms.ToTensor()(image)
         
         
-        depth = GT_transforms(depth)
+        depth = self.GT_transform(depth)
         
-        seg = GT_transforms(seg)
+        seg = self.GT_transform(seg)
             
-        inst = GT_transforms(inst)
+        inst = self.GT_transform(inst)
         
         return image, depth, seg, inst
     
