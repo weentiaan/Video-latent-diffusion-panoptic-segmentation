@@ -80,7 +80,7 @@ train_kwargs:
    sample_posterior: False
    sample_posterior_rgb: False
    remap_seg: True
-   train_num_steps: 35000
+   train_num_steps: 5000
    batch_size: 8
    accumulate: 1
    num_workers: 2

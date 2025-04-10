@@ -80,7 +80,7 @@ train_kwargs:
    sample_posterior: False
    sample_posterior_rgb: False
    remap_seg: True
-   train_num_steps: 35000
+   train_num_steps: 5000
    batch_size: 8
    accumulate: 1
    num_workers: 2
@@ -173,7 +173,7 @@ transformation_kwargs:
 train_db_name:
 val_db_name:
 split: 'val'
-num_classes: 128   # max number of instances we can detect
+num_classes: 19   # max number of instances we can detect
 num_bits: 7        # if we want to detect 128 instances, we need 7 bits
 has_bg: False
 ignore_label: 0

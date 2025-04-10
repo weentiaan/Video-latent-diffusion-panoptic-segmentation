@@ -69,6 +69,7 @@ class GeneralVAESeg(nn.Module):
         self.enable_mid_block = num_mid_blocks > 0
         self.num_mid_blocks = num_mid_blocks
         self.downsample_factor = 2 ** (len(block_out_channels) - 1)
+        self.downsample_factor = 2 ** (len(block_out_channels) - 1)
         self.interpolation_factor = self.downsample_factor // (2 ** num_upscalers)
         if "discrete" in parametrization:
             num_embeddings = 128
