@@ -45,6 +45,7 @@ def main(cfg: DictConfig) -> None:
     cfg_dataset = cfg_base | cfg_dataset  # overwrite base configs with dataset specific configs
     root_dir = os.path.join(cfg['env']['root_dir'], project_dir)
     data_dir = cfg['env']['data_dir']
+    print()
     cfg_dataset, project_name = prepare_config(cfg_dataset, root_dir, data_dir, run_idx=cfg['run_idx'])
     project_name = f"{cfg_dataset['train_db_name']}_{project_name}"
     print(colored(f"Project name: {project_name}", 'red'))

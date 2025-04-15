@@ -1,28 +1,83 @@
 """
-Author: Wouter Van Gansbeke
-
-Dataset class for COCO Panoptic Segmentation
+Author: (Adapted from Wouter Van Gansbeke)
+Dataset class for KITTI Panoptic Segmentation and Mask Inpainting
 Licensed under the CC BY-NC 4.0 license (https://creativecommons.org/licenses/by-nc/4.0/)
 """
 
 import os
-import json
-import torch
-
 import numpy as np
+import torch
 import torch.utils.data as data
 from PIL import Image
-from typing import Optional, Any, Tuple
+from typing import Optional, Tuple, Any
 import random
 from collections import defaultdict
+import torchvision.transforms as T
 
 from ldmseg.data.util.mypath import MyPath
 from ldmseg.utils.utils import color_map
 from ldmseg.data.util.mask_generator import MaskingGenerator
 
+# ----------------- 辅助函数 -----------------
 
-class COCO(data.Dataset):
-     KITTI_CATEGORIES = [
+def get_color_map(num_colors):
+    np.random.seed(42)
+    return np.random.randint(0, 256, (num_colors, 3), dtype=np.uint8)
+
+def colorize_panoptic(panoptic_map, colormap):
+    h, w = panoptic_map.shape
+    color_image = np.zeros((h, w, 3), dtype=np.uint8)
+    unique_ids = np.unique(panoptic_map)
+    for uid in unique_ids:
+        if uid == 255:
+            color = np.array([0, 0, 0], dtype=np.uint8)
+        else:
+            color = colormap[uid % len(colormap)]
+        color_image[panoptic_map == uid] = color
+    return color_image
+
+def encode_segmentation_mask(seg_img: np.ndarray, color_to_label: dict) -> np.ndarray:
+    H, W = seg_img.shape
+    label_map = np.zeros((H, W), dtype=np.int64)
+    for color, label in color_to_label.items():
+        mask = np.all(seg_img == np.array(color, dtype=np.uint8), axis=-1)
+        label_map[mask] = label
+    return label_map
+
+def encode_bitmap(x: torch.Tensor, n: int = 7, fill_value: float = 0.5):
+    """
+    将二维标签图 x (H, W) 进行 bit 编码，返回形状 (n, H, W) 的 Tensor 以及 ignore mask。
+    假设 ignore_label 为 0。
+    """
+    ignore_mask = x == 0
+    x = torch.bitwise_right_shift(x, torch.arange(n, device=x.device)[:, None, None])
+    x = torch.remainder(x, 2).float()
+    x[:, ignore_mask] = fill_value
+    return x, ignore_mask
+
+# ----------------- KITTI 数据集类 -----------------
+
+class KITTI(data.Dataset):
+     
+    def __init__(
+        self,
+        prefix: str,
+        split: str = 'train',
+        tokenizer: Optional[Any] = None,
+        transform: Optional[Any] = None,
+        download: bool = False,
+        remap_labels: bool = False,
+        caption_dropout: float = 0.0,
+        overfit: bool = False,
+        encoding_mode: str = 'color',   # 'color', 'random_color', 'bits', 'none'
+        caption_type: str = 'none',     # 'none', 'caption', 'class_label', 'blip'
+        inpaint_mask_size: Optional[Tuple[int]] = None,
+        num_classes: int = 6,
+        fill_value: int = 0.5,
+        ignore_label: int = 0,
+        inpainting_strength: float = 0.0,
+    ):
+        KITTI_CATEGORIES = [
         {"color": [0, 0, 0], "isthing": 0, "id": 0,  "name": "unlabeled"},
         {"color": [0, 0, 0], "isthing": 0, "id": 1,  "name": "outlier"},
         {"color": [0, 0, 142], "isthing": 1, "id": 10, "name": "car"},
@@ -44,57 +99,44 @@ class COCO(data.Dataset):
         {"color": [182, 182, 255], "isthing": 0, "id": 26, "name": "vegetation"},
         {"color": [0, 82, 0], "isthing": 0, "id": 27, "name": "trunk"},
         {"color": [120, 166, 157], "isthing": 0, "id": 28, "name": "terrain"},
-        {"color": [110, 76, 0], "isthing": 0, "id": 29, "name": "sky"}
-    ]
-    KITTI_CATEGORY_NAMES = [k["name"] for k in KITTI_CATEGORIES]
-
-    def __init__(
-        self,
-        prefix: str,
-        split: str = 'train',
-        tokenizer: Optional[Any] = None,
-        transform: Optional[Any] = None,
-        download: bool = False,
-        remap_labels: bool = False,
-        caption_dropout: float = 0.0,
-        overfit: bool = False,
-        encoding_mode: str = 'bits',  # 使用 bit 编码
-        caption_type: str = 'none',
-        inpaint_mask_size: Optional[Tuple[int, int]] = None,
-        num_classes: int = 6,  # KITTI 此处类别总数为：我们保留背景(0)和 5 个实例目标，即6类标签
-        fill_value: int = 0.5,
-        ignore_label: int = 255,
-        inpainting_strength: float = 0.0,
-    ):
+        {"color": [110, 76, 0], "isthing": 0, "id": 29, "name": "sky"}]
+        self.KITTI_CATEGORY_NAMES = [cat["name"] for cat in KITTI_CATEGORIES]
+        self.KITTI_COLOR_TO_LABEL = {tuple(cat["color"]): idx for idx, cat in enumerate(KITTI_CATEGORIES)}
         """
         Args:
-            prefix (str): KITTI 数据集根目录
-            split (str): 'train' 或 'val'（根据你的数据集划分）
-            tokenizer: (可选) 文本 tokenizer
-            transform: (可选) 图像和 mask 的 transform
-            download (bool): 是否下载数据（通常为 False）
-            remap_labels (bool): 是否重新映射标签
-            caption_dropout (float): caption dropout 概率
-            overfit (bool): 是否只使用一小部分图像用于 overfit 调试
-            encoding_mode (str): 这里设为 'bits' 表示使用 bit 编码
-            caption_type (str): 'none' 或其他文本描述模式
-            inpaint_mask_size (Tuple[int, int], optional): inpainting mask 大小
-            num_classes (int): 输出类别数（包括背景），此处设为 6（背景 + 5个目标）
-            fill_value (int): bit 编码中无效像素填充值
-            ignore_label (int): 无效标签的值
-            inpainting_strength (float): inpainting 强度
+          prefix: 数据集根目录，例如 '/root/autodl-tmp/kitti'
+          split: 'train' 或 'val'
+          tokenizer: 用于 caption 处理
+          transform: 针对输入 image 的 transform，注意 resize 用 bilinear 插值
+          download: 必须为 False
+          remap_labels, caption_dropout, overfit, encoding_mode, caption_type: 与 COCO 接口一致
+          inpaint_mask_size: inpainting 掩码尺寸，默认为 (64, 64)
+          num_classes: 数据集类别数，此处为6
+          fill_value: bit encoding 时 ignore 区域的填充值
+          ignore_label: ignore label 数值（这里按 KITTI 数据设置为0）
+          inpainting_strength: inpainting 掩码生成强度
         """
-        # 设置路径，假设 KITTI 的图像位于 training/image_2，mask 位于 training/instance_2
-        root = MyPath.db_root_dir('kitti', prefix=prefix)
-        self.root = root
+        transform = T.Compose([
+        T.Resize((192, 640)),  # 对 image 使用 bilinear resize
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225])
+    ])
+        self.root = prefix
         self.prefix = prefix
-        valid_splits = ['train', 'val']
-        assert split in valid_splits, f"split should be one of {valid_splits}"
+        valid_splits = ['train', 'val', 'test']
+        print("Split:", split)
+        assert split in valid_splits, f"Split must be one of {valid_splits}"
+        assert not download, "download must be False"
         self.split = split
         self.tokenizer = tokenizer
         self.caption_dropout = caption_dropout
+        assert caption_type in ['none', 'caption', 'class_label', 'blip']
+        assert encoding_mode in ['color', 'random_color', 'bits', 'none']
+        self.encoding_mode = encoding_mode
+        self.caption_type = caption_type
 
-        self.num_classes = num_classes  # 例如 6
+        self.num_classes = num_classes
         self.ignore_label = ignore_label
         self.fill_value = fill_value
         self.inpainting_strength = inpainting_strength
@@ -102,166 +144,311 @@ class COCO(data.Dataset):
         if inpaint_mask_size is None:
             inpaint_mask_size = (64, 64)
         self.maskgenerator = MaskingGenerator(input_size=inpaint_mask_size, mode='random_local')
+        self.meta_data = self.get_metadata()
+        self.transform = transform  # 仅适用于 image
+        self.cmap = color_map()
 
-        self.transform = transform
-        self.cmap = color_map()  # 可以自行定制或使用默认颜色
-
-        print("Initializing dataloader for KITTI {} set".format(self.split))
+        print("Initializing dataloader for KITTI {} set".format(split))
+        # 假设 KITTI 数据存放于 prefix/split 目录下
+        _image_dir = os.path.join(self.root, split)
+        self.samples = []
+        sample_dict = {}
+        # 文件名格式示例：
+        # 000000_000000_gtFine_class.png, 000000_000000_gtFine_instance.png,
+        # 000000_000000_leftImg8bit.png, 000008_000000_depth_707.0911865234375.png
+        for file in sorted(os.listdir(_image_dir)):
+            base, ext = os.path.splitext(file)
+            if ext.lower() != ".png":
+                continue
+            parts = base.split('_')
+            if len(parts) >= 4 and parts[2] == "gtFine":
+                scene, frame = parts[0], parts[1]
+                typ = parts[3]  # 'class' 或 'instance'
+            elif len(parts) == 3 and parts[2] == "leftImg8bit":
+                scene, frame = parts[0], parts[1]
+                typ = "leftImg8bit"
+            elif len(parts) >= 4 and parts[2] == "depth":
+                scene, frame = parts[0], parts[1]
+                typ = "depth"
+            else:
+                continue
+            if self.split=="train":
+                if frame>="000005":
+                    continue
+            else:
+                if frame>="000100":
+                    continue
+            if scene not in sample_dict:
+                sample_dict[scene] = {}
+            if frame not in sample_dict[scene]:
+                sample_dict[scene][frame] = {}
+            sample_dict[scene][frame][typ] = os.path.join(_image_dir, file)
+        for scene, frames in sample_dict.items():
+            for frame, files in frames.items():
+                if all(key in files for key in ['leftImg8bit', 'class', 'instance', 'depth']):
+                    self.samples.append(files)
+        print("Found {} samples in split {}".format(len(self.samples), split))
+        if overfit:
+            self.samples = self.samples[:1000]
         if self.split == 'train':
-            image_dir = os.path.join(self.root, 'training', 'image_2')
-            semseg_dir = os.path.join(self.root, 'training', 'instance_2')
+            self.pixel_threshold = 10
             self.training = True
-        elif self.split == 'val':
-            image_dir = os.path.join(self.root, 'testing', 'image_2')  # 假设 val 使用 testing 目录
-            semseg_dir = os.path.join(self.root, 'testing', 'instance_2')
+        else:
+            self.pixel_threshold = 0
             self.training = False
 
-        self.image_dir = image_dir
-        self.semseg_dir = semseg_dir
-
-        # 获取所有图像文件名（假设文件后缀为 .png 或 .jpg）
-        self.images = sorted([os.path.join(image_dir, f) for f in os.listdir(image_dir) if f.endswith('.png') or f.endswith('.jpg')])
-        self.semsegs = sorted([os.path.join(semseg_dir, f) for f in os.listdir(semseg_dir) if f.endswith('.png')])
-        print('Found {} images and {} segmentation maps.'.format(len(self.images), len(self.semsegs)))
-
-        # 根据文件名关联图片与分割标注（假设文件名相同）
-        self.images, self.semsegs = zip(*[
-            (img, sem) for img, sem in zip(self.images, self.semsegs)
-            if os.path.basename(img).split('.')[0] == os.path.basename(sem).split('.')[0]
-        ])
-        self.images = list(self.images)
-        self.semsegs = list(self.semsegs)
-        print("After matching, found {} samples".format(len(self.images)))
-
-        if overfit:
-            n_of = 1000
-            self.images = self.images[:n_of]
-            self.semsegs = self.semsegs[:n_of]
-
-        # 对于 KITTI，一般类别较少，这里直接构造映射字典
-        self.cat_info = {cat['id']: {'name': cat['name'], 'isthing': cat['isthing']} for cat in self.KITTI_CATEGORIES}
-
-        # 对于 remap_labels 部分，根据需要实现相应逻辑（这里简化为保持原标签）
-        self.meta_data = {}  # 可添加 remap 信息
-
-        # Display dataset stats
-        print('Number of dataset images: {:d}'.format(len(self.images)))
-
-    def __getitem__(self, index):
-        sample = {}
-        # 加载图像
-        img_path = self.images[index]
-        _img = Image.open(img_path).convert('RGB')
-        sample['image'] = _img
-
-        # 加载分割 mask
-        semseg_path = self.semsegs[index]
-        _semseg = np.array(Image.open(semseg_path).convert('L'))  # 假设分割 mask 为灰度图，数值表示类别标签
-        # 注意：KITTI 数据集中的分割 mask 数据格式可能需要根据具体格式做处理，
-        # 例如：可能需要对像素值进行 bit 拆分，如果原始标签为整数，使用 bit 编码将其转换为多通道 binary 表示
-        # 这里假设 _semseg 中的数值范围 [0, 2^n-1]，我们需要将其转换为一个多通道 bit 图像。
-        # 此处设定 bit 数：对于 6 个类别（含背景），可能需要 3 个 bit（但本问中语义类别为20，instance 50，所以 bit 数应为 5 和6），
-        # 但这里 KITTI 使用的标签就较少，我们假设 _semseg 的标签已经在 0~(num_classes-1) 范围内。
-        sample['semseg'] = _semseg.astype(np.uint8)
-
-        # 这里你需要根据你使用 bit 编码的方案将整型 mask 转换为 bit 编码表示，
-        # 示例：调用一个 encode_bitmap 函数（可以参考COCO模板中的 encode_bitmap），下面我们假设使用 7 位编码，
-        # 但请注意对于 KITTI，你可能希望按实际需要使用更少或更多位数。这里假设我们对 KITTI 语义 mask 使用固定 bit 数进行编码，
-        # 注意：如果你的 KITTI 语义标签实际数值较低（例如 0~5），则 bit 编码可能只需 3 位，但如果你同时编码 instance，
-        # 则假设语义部分使用 5 位，instance 部分使用 6 位，合计11位。如你所问，上述 KITTI 应使用 11 个通道作为输入。
-        # 下面只给出语义部分的例子，实例部分需类似处理，并最终拼接。
-        # 例如，我们调用一个 encode_bitmap： (注意，这里仅作为参考)
-        from ldmseg.data.util.mypath import MyPath  # 假设你的工具中有该函数
-        # 这里假设你的 encoding_mode 为 'bits'
-        if hasattr(self, 'encoding_mode') and self.encoding_mode == 'bits':
-            # 此处 n 可设置为合计 bit 数，例如语义部分 5, instance 部分 6，共 11。
-            n_bits = 11
-            # 这里我们利用一个简单的实现，将 _semseg (二维) 转换为 n_bits 通道二值表示
-            # 我们用 np.unpackbits 需要 uint8 数组且默认拆成 8 位，这里可以自定义实现
-            def int_to_bits(arr, bits):
-                # arr: numpy array (H, W)
-                H, W = arr.shape
-                res = np.zeros((bits, H, W), dtype=np.uint8)
-                for i in range(bits):
-                    res[i] = ((arr >> i) & 1)
-                return res
-            encoded_semseg = int_to_bits(_semseg, n_bits)  # shape: [n_bits, H, W]
-            # 注意：实际 KITTI 数据可能需要分别对语义和 instance 分开编码，然后拼接，
-            # 这里为示例直接编码整幅 mask
-            sample['image_semseg'] = encoded_semseg
-            # 将该编码转换为 tensor
-            sample['image_semseg'] = torch.from_numpy(sample['image_semseg']).float()
-        else:
-            # 其他编码方式，直接转换为 tensor
-            sample['image_semseg'] = torch.from_numpy(_semseg).unsqueeze(0).float()
-
-        # 设置 mask（这里简单赋值全1，实际可根据需要修改）
-        sample['mask'] = torch.ones_like(sample['image_semseg'][0]).float()
-
-        # meta 信息
-        sample['meta'] = {
-            'im_size': (_img.size[1], _img.size[0]),
-            'image_file': img_path,
-            'image_id': int(os.path.basename(img_path).split('.')[0]),
-        }
-
-        # 处理 transform
-        if self.transform is not None:
-            sample = self.transform(sample)
-
-        # 如果使用 tokenizer（例如用于 captioning 之类），这里设为空
-        sample['text'] = ""
-
-        # inpainting mask（可选）
-        sample['inpainting_mask'] = self.maskgenerator(t=self.inpainting_strength)
-
-        return sample
-
     def __len__(self):
-        return len(self.images)
+        return len(self.samples)
+    def _remap_labels_fn(self, labels, max_val=None, keep_background_fixed=True):
+        # keep the original background class index
+        # max val is the maximum number of classes to remap to
+        # ignore index is kept fixed
+
+        # remapping only works if additional background classes are ordered from 0 to N.
+        max_val = max_val if max_val is not None else self.num_classes
+        unique_values = [x for x in np.unique(labels) if x != self.ignore_label]
+        assert len(unique_values) < max_val, f"Number of unique values {len(unique_values)} is larger or equal than max_val {max_val}"  # noqa
+
+        # np.random.seed(1)
+        targets = np.random.choice(max_val - 1,
+                                   size=len(unique_values),
+                                   replace=False)  # sampling without replacement
+        targets = targets + 1
+
+        # mapping dict
+        mapping = dict(zip(unique_values, targets))
+        remapped_labels = np.full(labels.shape, self.ignore_label, dtype=labels.dtype)
+        for val, remap_val in mapping.items():
+            remapped_labels[labels == val] = remap_val
+        mapping_np = np.full(self.num_classes, -1, dtype=int)
+        for idx, (_, remap_val) in enumerate(mapping.items()):
+            mapping_np[idx] = remap_val
+
+        # sanity checks: make sure all target values are smaller than max_val and unique
+        assert np.all(mapping_np[mapping_np != -1] < max_val)
+        assert np.all(mapping_np[mapping_np != -1] >= 0)
+        assert len(np.unique(mapping_np[mapping_np != -1])) == len(mapping_np[mapping_np != -1])
+        assert len(np.unique(mapping_np[mapping_np != -1])) == len(unique_values)
+
+        return remapped_labels, mapping
+
+    def encode_semseg(self, semseg, cmap=None):
+        # we will encode the semseg map with a color map
+        if cmap is None:
+            cmap = color_map()
+        seg_t = semseg.astype(np.uint8)
+        array_seg_t = np.full((seg_t.shape[0], seg_t.shape[1], cmap.shape[1]), self.ignore_label, dtype=cmap.dtype)
+        for class_i in np.unique(seg_t):
+            array_seg_t[seg_t == class_i] = cmap[class_i]
+        return array_seg_t
+
+    def encode_semseg_random(self, semseg, cmap=None):
+        seg_t = semseg.astype(np.uint8)
+        color_palette = set()
+        array_seg_t = np.full((seg_t.shape[0], seg_t.shape[1], cmap.shape[1]), self.ignore_label, dtype=cmap.dtype)
+        unique_classes = np.unique(seg_t)
+        while len(color_palette) < len(unique_classes):
+            color_palette.add(tuple(np.random.choice(range(256), size=3)))
+        for class_i in unique_classes:
+            if class_i == self.ignore_label:
+                continue
+            array_seg_t[seg_t == class_i] = color_palette.pop()
+        assert array_seg_t.max() < 256
+        return array_seg_t
+
+    def encode_bitmap(self, x: torch.Tensor, n: int = 7, fill_value: float = 0.5):
+        ignore_mask = x == self.ignore_label
+        x = torch.bitwise_right_shift(x, torch.arange(n, device=x.device)[:, None, None])  # shift with n bits
+        x = torch.remainder(x, 2).float()                                                  # take modulo 2 to get 0 or 1
+        x[:, ignore_mask] = fill_value                                                     # set invalid pixels to 0.5
+        return x, ignore_mask
+
+    def decode_bitmap(self, x: torch.Tensor, n: int = 7):
+        x = (x > 0.).float()                                          # output between -1 and 1
+        n = x.shape[0]                                                # number of channels = number of bits
+        x = x * 2 ** torch.arange(n, device=x.device)[:, None, None]  # get the value of each bit
+        x = torch.sum(x, dim=0)                                       # sum over bits (no keepdim!)
+        x = x.long()                                                  # cast to int64 (or long)
+        return x
+
+    def get_inpainting_mask(self, strength=0.5):
+        mask = self.maskgenerator(t=strength)
+        mask = torch.from_numpy(mask).bool()
+        return mask
 
     def get_class_names(self):
         return self.KITTI_CATEGORY_NAMES
 
-    def __str__(self):
-        return 'KITTI(split=' + str(self.split) + ')'
-
-    # 其他函数例如 _remap_labels_fn、encode_semseg 等可以按需移植或简化
-    # 这里简单保留其中的 encode_bitmap 用于 bit 编码转换
+    def get_metadata(self):
+        meta = {}
+        thing_dataset_id_to_contiguous_id = {}
+        stuff_dataset_id_to_contiguous_id = {i: i for i in range(self.num_classes)}
+        cat2name = {i: f"cls_{i}" for i in range(self.num_classes)}
+        meta["thing_dataset_id_to_contiguous_id"] = thing_dataset_id_to_contiguous_id
+        meta["stuff_dataset_id_to_contiguous_id"] = stuff_dataset_id_to_contiguous_id
+        meta["cat2name"] = cat2name
+        meta["panoptic_json"] = None
+        meta["panoptic_root"] = self.root
+        return meta
 
     def encode_bitmap(self, x: torch.Tensor, n: int = 7, fill_value: float = 0.5):
-        # x: tensor (H, W), ignore pixels对应 ignore_label 的位置设置为 fill_value
         ignore_mask = x == self.ignore_label
-        # 对每个像素的整数进行 bit 操作，得到 n 个通道
-        H, W = x.shape
-        bits = []
-        for i in range(n):
-            bit = ((x >> i) & 1).float()
-            bits.append(bit)
-        bits = torch.stack(bits, dim=0)  # shape: [n, H, W]
-        bits[:, ignore_mask] = fill_value
-        return bits, ignore_mask
+        x = torch.bitwise_right_shift(x, torch.arange(n, device=x.device)[:, None, None])
+        x = torch.remainder(x, 2).float()
+        x[:, ignore_mask] = fill_value
+        return x, ignore_mask
 
+    def __getitem__(self, idx):
+        sample = {}
+        sample_paths = self.samples[idx]
+        
+        # ---------- 1. 读取并 Resize 输入图像 ----------
+        # 输入图像：leftImg8bit.png，采用 bilinear 插值 resize 至 (640,192)
+        image = Image.open(sample_paths['leftImg8bit']).convert('RGB')
+        image = image.resize((640, 192), Image.BILINEAR)
+        if self.transform:
+            image_tensor = self.transform(image)
+        else:
+            image_tensor = T.ToTensor()(image)
+        sample['image'] = image_tensor
+
+        # ---------- 2. 处理 Ground Truth 标签 ----------
+        # 语义标签：class.png，转换为单通道 GT。用 nearest 插值 resize 至 (640,192)
+        sem_img = Image.open(sample_paths['class']).convert('L')
+        sem_img = sem_img.resize((640, 192), Image.NEAREST)
+        sem_np_color = np.array(sem_img, dtype=np.uint8)
+        sem_np = encode_segmentation_mask(sem_np_color, self.KITTI_COLOR_TO_LABEL)
+        # 返回为整数 Tensor（不做归一化），直接转换为 tensor
+        sample['semseg'] = torch.from_numpy(sem_np).long()
+
+        # 实例标签：instance.png，灰度加载，用 nearest 插值 resize
+        inst_img = Image.open(sample_paths['instance']).convert('L')
+        inst_img = inst_img.resize((640, 192), Image.NEAREST)
+        inst_np = np.array(inst_img, dtype=np.uint8)
+        
+        # 深度图：depth.png，用 nearest 插值 resize；保持原有数值
+        depth_img = Image.open(sample_paths['depth'])
+        depth_img = depth_img.resize((640, 192), Image.NEAREST)
+        # 如果深度图本身为单通道且保存数值，则直接转换为 tensor
+        depth_np = np.array(depth_img, dtype=np.float32)  # 假定深度为 float32 数值
+       
+        # ---------- 3. 构造 mask ----------
+        mask_np = np.ones_like(sem_np, dtype=np.uint8) * 255
+        sample['mask'] = torch.from_numpy(mask_np)  # 返回 shape (H, W)
+
+        # ---------- 4. 读取预生成的全景彩色图像 ----------
+        # 从固定目录 "/root/autodl-tmp/pop_gt" 读取，文件名格式为 "{idx}_output.png"
+        if self.split=="train":
+            pop_gt_path = os.path.join("/root/autodl-tmp/pop_gt", f"{idx}_output.png")
+        else:
+            pop_gt_path = os.path.join("/root/autodl-tmp/pop_gt_val", f"{idx}_output.png")
+        color_img = Image.open(pop_gt_path).convert('RGB')
+        color_img = color_img.resize((640, 192), Image.BILINEAR)
+        sample['image_semseg'] = T.ToTensor()(color_img)
+
+        # ---------- 5. 处理 depth 与 instance ----------
+        sample['depth'] = torch.from_numpy(depth_np)
+        sample['instance'] = torch.from_numpy(inst_np).long()
+
+        # ---------- 6. 构造 meta 信息 ----------
+        try:
+            parts = os.path.basename(sample_paths['leftImg8bit']).split('_')
+            scene = int(parts[0])
+            frame = int(parts[1])
+            image_id = scene * 10000 + frame
+        except Exception:
+            image_id = os.path.basename(sample_paths['leftImg8bit'])
+        meta = {
+            'im_size': (192, 640),
+            'image_file': sample_paths['leftImg8bit'],
+            'image_id': image_id,
+            'segments_info': {}  # 暂不提供详细 segments_info
+        }
+        meta['gt_cat'] = torch.from_numpy(sem_np).long()
+        meta['gt_ins'] = torch.from_numpy(inst_np).long()
+        sample['meta'] = meta
+
+        # ---------- 7. caption 与 inpainting_mask ----------
+        sample['text'] = ""
+        inpainting_mask = self.maskgenerator(t=self.inpainting_strength)
+        sample['inpainting_mask'] = torch.from_numpy(inpainting_mask).bool()
+
+        # ---------- 8. 根据 encoding_mode 后处理 image_semseg ----------
+        if self.encoding_mode == 'bits':
+            sample_sem = torch.from_numpy(sem_np).long()
+            image_semseg_bits, _ = self.encode_bitmap(sample_sem, n=7, fill_value=self.fill_value)
+            sample['image_semseg'] = image_semseg_bits
+        elif self.encoding_mode == 'none':
+            sample_sem = torch.from_numpy(sem_np).float()
+            sample['image_semseg'] = sample_sem.unsqueeze(0).repeat(3, 1, 1) / self.num_classes
+
+        # ---------- 9. 如果提供 tokenizer，则 tokenization ----------
+        if self.tokenizer is not None:
+            sample['tokens'] = self.tokenizer(sample['text'],
+                                              padding='max_length',
+                                              max_length=77,
+                                              truncation=True,
+                                              return_tensors='pt').input_ids.squeeze(0)
+        assert 'instance' in sample, "Missing instance segmentation in sample"
+        return sample
+
+    def _load_img(self, index, mode='array'):
+        _img = Image.open(self.samples[index]['leftImg8bit']).convert('RGB')
+        if mode == 'pil':
+            return _img
+        return np.array(_img)
+
+    def _load_semseg(self, index, mode='array'):
+        sample_paths = self.samples[index]
+        sem_img = Image.open(sample_paths['class']).convert('L')
+        sem_img = sem_img.resize((640, 192), Image.NEAREST)
+        sem_np_color = np.array(sem_img, dtype=np.uint8)
+        sem_np = encode_segmentation_mask(sem_np_color, self.KITTI_COLOR_TO_LABEL)
+        segments_info = {}
+        captions_info = []
+        key_id = os.path.basename(sample_paths['leftImg8bit'])
+        if mode == 'pil':
+            return Image.fromarray(sem_np.astype(np.uint8))
+        return sem_np, segments_info, captions_info, key_id
+
+    def _validate_annotations_simple(self):
+        from tqdm import tqdm
+        for i in tqdm(range(len(self))):
+            semseg, _, _, _ = self._load_semseg(i)
+            unique_labels = np.unique(semseg)
+            unique_labels = unique_labels[unique_labels != self.ignore_label]
+            assert len(unique_labels) > 0
+        return
+
+    def __str__(self):
+        return 'KITTI(split=' + str(self.split) + ')'
+        
 if __name__ == '__main__':
     import torchvision.transforms as T
-    from ldmseg.data.util.mypath import MyPath
+    from torch.utils.data import DataLoader
 
-    size = 256
     transforms = T.Compose([
-        T.Resize((size, size)),
+        T.Resize((192, 640)),  # 对 image 使用 bilinear resize
         T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225])
     ])
-
+    dataset_root = '/root/autodl-tmp/video_sequence'
     dataset = KITTI(
-        prefix='/path/to/KITTI',  # 根据实际路径修改
-        split='train',
-        transform=None,
-        remap_labels=False,
-        encoding_mode='bits',
-        caption_type='none',
-        overfit=False,
-        num_classes=6,  # 背景 + 5个实例目标
+        prefix=dataset_root,
+        split='val',
+        transform=transforms,
+        remap_labels=False
     )
-    print("Number of KITTI samples:", len(dataset))
-    sample = dataset[0]
-    print("Sample image_semseg shape:", sample['image_semseg'].shape)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
+    for sample in dataloader:
+        print("image:", sample['image'].shape)
+        print("semseg:", sample['semseg'].shape if isinstance(sample['semseg'], torch.Tensor) else sample['semseg'].size())
+        print("mask:", sample['mask'].shape if isinstance(sample['mask'], torch.Tensor) else sample['mask'].size())
+        print("image_semseg:", sample['image_semseg'].shape)
+        print("depth:", sample['depth'].shape)
+        print("instance:", sample['instance'].shape)
+        print("meta:", sample['meta'])
+        print("text:", sample['text'])
+        print("inpainting_mask:", sample['inpainting_mask'].shape)
+        break

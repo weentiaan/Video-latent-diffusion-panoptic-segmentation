@@ -1,96 +1,134 @@
 import numpy as np
-import six
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
 
-# 固定参数：instance 部分用6位编码，即MAX_INS = 2**6 = 64
-MAX_INS = 64
-# 对于 KITTI，我们认为评价时有效类别为：
-# [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
-VALID_CAT_IDS = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
-NUM_EVAL_CAT = len(VALID_CAT_IDS)  # 20个类别
-# 构造连续映射：dataset类别 id -> 连续索引（0 ~ 19）
-EVAL_MAPPING = {cat_id: idx for idx, cat_id in enumerate(VALID_CAT_IDS)}
+class PanopticEvaluatorKITTI:
+    def __init__(self, iou_thresh=0.5, thing_ids=None, ignore_label=0):
+        """
+        针对 KITTI 数据集的全景评价器
 
-def vpq_eval(element, num_cat=NUM_EVAL_CAT):
-    """
-    计算单张图像的 VPQ 统计信息，并返回 (iou_per_class, tp_per_class, fn_per_class, fp_per_class)。
-    
-    输入 element 为 [pred, gt]，其中 pred 和 gt 均为 numpy 数组，形状 (H, W)。
-    编码规则假定为：每个像素值 = category * MAX_INS + instance，
-    其中 category 为 KITTI 中的原始类别 id（例如 10, 11, ..., 29），
-    而 instance 为实例编码（取值范围 0 ~ MAX_INS-1）。
-    
-    只有当预测和 GT 的 category 都在 VALID_CAT_IDS 中时，才会计入统计；
-    否则，跳过（例如 unlabeled/outlier）。
-    """
-    offset = 2 ** 30  # 用于构造联合编码
-    # 初始化统计数组，长度固定为 num_cat（20）
-    iou_per_class = np.zeros(num_cat, dtype=np.float64)
-    tp_per_class = np.zeros(num_cat, dtype=np.float64)
-    fn_per_class = np.zeros(num_cat, dtype=np.float64)
-    fp_per_class = np.zeros(num_cat, dtype=np.float64)
+        参数:
+            iou_thresh: IoU 阈值，通常设为 0.5
+            thing_ids: 属于实例（thing）类别的语义标签集合，例如 {10,11,12,13,14,15,16,17}
+            ignore_label: 被忽略的标签（例如 0）
+        """
+        if thing_ids is None:
+            thing_ids = {10, 11, 12, 13, 14, 15, 16, 17}
+        self.iou_thresh = iou_thresh
+        self.thing_ids = thing_ids
+        self.ignore_label = ignore_label
+        # 用于区分类别内部不同实例的编码常数，一般取一个足够大的值
+        self.max_ins = 2 ** 20  # 约 1e6
+        self.reset()
 
-    def _ids_to_counts(arr):
-        ids, counts = np.unique(arr, return_counts=True)
-        return dict(zip(ids, counts))
-    
-    pred_areas = _ids_to_counts(element[0])
-    gt_areas = _ids_to_counts(element[1])
-    
-    # 此处暂不做对 void 的特殊处理（可根据需要扩展 ignore 规则）
-    
-    # 构造联合编码：这样可以方便计算交集
-    int_ids = element[1].astype(np.int64) * offset + element[0].astype(np.int64)
-    int_areas = _ids_to_counts(int_ids)
-    
-    def prediction_void_overlap(pred_id):
-        # 可扩展：对 void 类区域 overlap 的处理（目前直接返回0）
-        return 0
+    def reset(self):
+        self.TP = 0
+        self.FP = 0
+        self.FN = 0
+        self.iou_sum = 0.0
 
-    def prediction_ignored_overlap(pred_id):
-        # 此处略过 ignored overlap 处理
-        return 0
+    def _combine_panoptic(self, semseg, instance):
+        """
+        根据语义分割和实例分割生成全景 GT 图：
+          - 对于属于 thing 类别（在 self.thing_ids 中）的像素，
+            编码方式为： semseg * max_ins + instance
+          - 对于 stuff 类别，直接使用语义标签；
+          - 对于 ignore 标签（如 0）统一设置为 -1，不参与评价。
+        参数:
+            semseg: (H, W) 的 numpy 数组，GT 语义分割
+            instance: (H, W) 的 numpy 数组，GT 实例分割
+        返回:
+            panoptic: (H, W) 的 numpy 数组，合成后的全景 GT 编码
+        """
+        semseg = semseg.astype(np.int32)
+        instance = instance.astype(np.int32)
+        # 对于 thing 类别按照编码规则合并；否则直接用 semseg 值
+        panoptic = np.where(np.isin(semseg, list(self.thing_ids)),
+                            semseg * self.max_ins + instance,
+                            semseg)
+        # ignore 部分统一设置为 -1
+        panoptic[semseg == self.ignore_label] = -1
+        return panoptic
 
-    gt_matched = set()
-    pred_matched = set()
+    def _compute_iou(self, mask1, mask2):
+        """
+        计算两个二值 mask 的交并比（IoU）
+        """
+        intersection = np.logical_and(mask1, mask2).sum()
+        union = np.logical_or(mask1, mask2).sum()
+        if union == 0:
+            return 0.0
+        return intersection / union
 
-    for int_id, area in six.iteritems(int_areas):
-        gt_id = int(int_id // offset)
-        pred_id = int(int_id % offset)
-        gt_cat = int(gt_id // MAX_INS)
-        pred_cat = int(pred_id // MAX_INS)
-        # 如果预测和 GT 的类别不在有效集合中，则跳过
-        if gt_cat not in EVAL_MAPPING or pred_cat not in EVAL_MAPPING:
-            continue
-        # 使用连续映射后的类别
-        cont_gt = EVAL_MAPPING[gt_cat]
-        cont_pred = EVAL_MAPPING[pred_cat]
-        # 如果两者不同，则不认为匹配
-        if cont_gt != cont_pred:
-            continue
-        union = gt_areas.get(gt_id, 0) + pred_areas.get(pred_id, 0) - area - prediction_void_overlap(pred_id)
-        iou = area / union if union > 0 else 0
-        if iou > 0.5:
-            tp_per_class[cont_gt] += 1
-            iou_per_class[cont_gt] += iou
-            gt_matched.add(gt_id)
-            pred_matched.add(pred_id)
-    
-    for gt_id, area in gt_areas.items():
-        cat = gt_id // MAX_INS
-        if cat not in EVAL_MAPPING:
-            continue
-        if gt_id in gt_matched:
-            continue
-        cont_idx = EVAL_MAPPING[cat]
-        fn_per_class[cont_idx] += 1
+    def evaluate_image(self, pred_panoptic, gt_semseg, gt_instance):
+        """
+        对单张图像进行评价：
+          - 先将 GT 的 semseg 与 instance 合成全景 GT 图
+          - 遍历 GT 中的每个区域（除去 ignore 区域），在预测结果中寻找相同类别（根据编码）IoU
+            最大且大于阈值的区域作为匹配（TP）；未匹配计 FN，而预测中多出的区域计 FP。
+        返回:
+          tp, fp, fn, iou_sum
+        """
+        gt_panoptic = self._combine_panoptic(gt_semseg, gt_instance)
+        # 提取所有区域，不包括 ignore（即 -1）
+        gt_ids = np.unique(gt_panoptic)
+        pred_ids = np.unique(pred_panoptic)
+        gt_ids = gt_ids[gt_ids != -1]
+        pred_ids = pred_ids[pred_ids != -1]
 
-    for pred_id, area in pred_areas.items():
-        if pred_id in pred_matched:
-            continue
-        cat = pred_id // MAX_INS
-        if cat not in EVAL_MAPPING:
-            continue
-        cont_idx = EVAL_MAPPING[cat]
-        fp_per_class[cont_idx] += 1
+        # 构造区域对应的二值 mask
+        gt_masks = {gid: (gt_panoptic == gid) for gid in gt_ids}
+        pred_masks = {pid: (pred_panoptic == pid) for pid in pred_ids}
 
-    return (iou_per_class, tp_per_class, fn_per_class, fp_per_class)
+        matched_preds = set()
+        tp = 0
+        iou_sum = 0.0
+        # 对于每个 GT 区域，寻找最佳匹配的预测区域（类别必须一致）
+        for gt_id, gt_mask in gt_masks.items():
+            # 如果 gt_id 是 thing 类别，则类别为 gt_id // max_ins，否则为 gt_id 自身
+            gt_cat = (gt_id // self.max_ins) if gt_id >= self.max_ins else gt_id
+            best_iou = 0.0
+            best_pred = None
+            for pred_id, pred_mask in pred_masks.items():
+                pred_cat = (pred_id // self.max_ins) if pred_id >= self.max_ins else pred_id
+                if pred_cat != gt_cat:
+                    continue
+                iou = self._compute_iou(gt_mask, pred_mask)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_pred = pred_id
+            if best_iou >= self.iou_thresh and best_pred is not None:
+                tp += 1
+                iou_sum += best_iou
+                matched_preds.add(best_pred)
+        fp = len(pred_masks) - len(matched_preds)
+        fn = len(gt_masks) - tp
+        return tp, fp, fn, iou_sum
+
+    def add_image(self, pred_panoptic, gt_semseg, gt_instance):
+        """
+        对单张图像，累积评价指标
+        """
+        tp, fp, fn, iou_sum = self.evaluate_image(pred_panoptic, gt_semseg, gt_instance)
+        self.TP += tp
+        self.FP += fp
+        self.FN += fn
+        self.iou_sum += iou_sum
+
+    def evaluate(self):
+        """
+        根据累计的 TP、FP、FN、iou_sum 计算评价指标：
+            SQ = iou_sum / TP
+            RQ = TP / (TP + 0.5 * (FP + FN))
+            PQ = SQ * RQ
+        """
+        epsilon = 1e-10
+        if self.TP == 0:
+            sq = 0.0
+            rq = 0.0
+        else:
+            sq = self.iou_sum / (self.TP + epsilon)
+            rq = self.TP / (self.TP + 0.5 * (self.FP + self.FN) + epsilon)
+        pq = sq * rq
+        return {"pq": pq, "sq": sq, "rq": rq, "iou_sum": self.iou_sum, "tp": self.TP, "fp": self.FP, "fn": self.FN}

@@ -1,39 +1,24 @@
 """
-Author: Wouter Van Gansbeke
-
-Dataset class to be used for training and evaluation
+Author: Wouter Van Gansbeke (Adapted for KITTI)
+Dataset class to be used for training and evaluation.
 Licensed under the CC BY-NC 4.0 license (https://creativecommons.org/licenses/by-nc/4.0/)
 """
-
 
 import torch
 from torch import nn
 from torchvision import transforms as T
 from typing import Callable, Dict, Tuple, Any, Optional
 
-
 class DatasetBase(object):
-
-    def __init__(
-        self,
-        data_dir: str
-    ) -> None:
-        """ Base class for datasets
-        """
-
+    def __init__(self, data_dir: str) -> None:
+        """Base class for datasets."""
         self.data_dir = data_dir
 
-    def get_train_transforms(
-        self,
-        p: Dict[str, Any]
-    ) -> Callable:
-        """ Returns a composition of transformations to be applied to the training images
-        """
-
+    def get_train_transforms(self, p: Dict[str, Any]) -> Callable:
+        """Returns a composition of transformations for training images."""
         normalize = T.Normalize(**p['normalize_params']) if p['normalize'] else nn.Identity()
         if p['type'] == 'crop_resize_pil':
             from .util import pil_transforms as pil_tr
-
             size = p['size']
             normalize = pil_tr.Normalize(**p['normalize_params']) if p['normalize'] else nn.Identity()
             transforms = T.Compose([
@@ -42,19 +27,12 @@ class DatasetBase(object):
                 pil_tr.ToTensor(),
                 normalize
             ])
-
         else:
             raise NotImplementedError(f'Unknown transformation type {p["type"]}')
-
         return transforms
 
-    def get_val_transforms(
-        self,
-        p: Dict
-    ) -> Callable:
-        """ Returns a composition of transformations to be applied to the validation images
-        """
-
+    def get_val_transforms(self, p: Dict) -> Callable:
+        """Returns a composition of transformations for validation images."""
         normalize = T.Normalize(**p['normalize_params']) if p['normalize'] else nn.Identity()
         if p['type'] in ['crop_resize_pil', 'random_crop_resize_pil']:
             from .util import pil_transforms as pil_tr
@@ -65,10 +43,8 @@ class DatasetBase(object):
                 pil_tr.ToTensor(),
                 normalize
             ])
-
         else:
             raise NotImplementedError(f'Unknown transformation type {p["type"]}')
-
         return transforms
 
     def get_dataset(
@@ -90,12 +66,13 @@ class DatasetBase(object):
         ignore_label: Optional[int] = None,
         inpainting_strength: Optional[float] = None,
     ) -> Any:
-        """ Returns the dataset to be used for training or evaluation
-        """
-
+        """Returns the dataset for training or evaluation."""
         if db_name in 'coco':
             from .coco import COCO
             dataset_cls = COCO
+        elif db_name in ['kitti', 'simikitti-dvps']:
+            from .kitti import KITTI
+            dataset_cls = KITTI
         else:
             raise NotImplementedError(f'Unknown dataset {db_name}')
 
@@ -118,7 +95,7 @@ class DatasetBase(object):
                     ignore_label=ignore_label,
                     inpainting_strength=inpainting_strength,
                 ) for sp in split
-                ]
+            ]
             return torch.utils.data.ConcatDataset(datasets)
         else:
             dataset = dataset_cls(

@@ -15,7 +15,7 @@ from termcolor import colored
 from typing import Dict, Any, Optional, Union, List, Tuple
 from tqdm import tqdm
 from PIL import Image
-from torchvision import transforms
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -25,7 +25,7 @@ import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data.distributed import DistributedSampler
-import cv2
+
 from .losses import SegmentationLosses
 from .optim import get_optim_general
 from ldmseg.data.dataset_base import DatasetBase
@@ -36,14 +36,8 @@ from ldmseg.utils import (
     is_main_process, color_map, gpu_gather, collate_fn,
     get_world_size
 )
-from dataset.semKITTI_dataset import SemKITTI_DVPS_Dataset
-from ..evaluations.new_eval import vpq_eval
-os.environ["RANK"] = "0"
-os.environ["WORLD_SIZE"] = "1"
-os.environ["MASTER_ADDR"] = "tcp://127.0.0.1"
-os.environ["MASTER_PORT"] = "54286"
 
-
+from ldmseg.evaluations import PanopticEvaluatorKITTI
 class TrainerAE(DatasetBase):
 
     def __init__(
@@ -104,8 +98,7 @@ class TrainerAE(DatasetBase):
             print(colored('Warning -- Accumulating gradients', 'yellow'))
         self.eff_batch_size = self.batch_size * self.gradient_accumulate_every
         self.image_size = p['transformation_kwargs']['size']
-        #self.latent_size = self.image_size // self.vae_model.module.downsample_factor
-        self.latent_size = self.image_size // self.vae_model.downsample_factor
+        self.latent_size = self.image_size // self.vae_model.module.downsample_factor
         self.mask_th = p['eval_kwargs']['mask_th']
         self.overlap_th = p['eval_kwargs']['overlap_th']
         self.count_th = p['eval_kwargs']['count_th']
@@ -128,44 +121,26 @@ class TrainerAE(DatasetBase):
         self.transforms_val = self.get_val_transforms(p['transformation_kwargs'])
         print('Train transforms', self.transforms)
         print('Val transforms', self.transforms_val)
-        # self.ds = self.get_dataset(p['train_db_name'],
-        #                            split=p['split'],
-        #                            transform=self.transforms,
-        #                            tokenizer=None,
-        #                            remap_labels=p['train_kwargs']['remap_seg'],
-        #                            encoding_mode=p['train_kwargs']['encoding_mode'],
-        #                            num_classes=p['num_classes'],
-        #                            fill_value=p['fill_value'],
-        #                            ignore_label=p['ignore_label'],
-        #                            inpainting_strength=p['inpainting_strength'])
-        # self.ds_val = self.get_dataset(p['val_db_name'],
-        #                                split='val',
-        #                                transform=self.transforms_val,
-        #                                tokenizer=None,
-        #                                remap_labels=p['train_kwargs']['remap_seg'],
-        #                                encoding_mode=p['train_kwargs']['encoding_mode'],
-        #                                num_classes=p['num_classes'],
-        #                                fill_value=p['fill_value'],
-        #                                ignore_label=p['ignore_label'],
-        #                                inpainting_strength=p['inpainting_strength'])
-        dataset_root = '/root/autodl-tmp/video_sequence'  # 修改为你的数据集根目录
-        image_transforms = transforms.Compose([transforms.Resize((192, 640)),
-                                               transforms.ToTensor(),
-                                               transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                                std=[0.229, 0.224, 0.225])
-    ])
-        GT_transforms = transforms.Compose([transforms.Resize((192, 640),
-                                            interpolation=transforms.InterpolationMode.NEAREST),
-                                            transforms.ToTensor(),
-    ])
-        train_dataset = SemKITTI_DVPS_Dataset(root=dataset_root,
-                                            split='train',
-                                          image_transform=image_transforms,
-                                             GT_transform=GT_transforms)
-        print(train_dataset.__getitem__)
-        self.ds=train_dataset
-        self.ds_val=train_dataset
-        self.ds.ignore_label=0
+        self.ds = self.get_dataset(p['train_db_name'],
+                                   split=p['split'],
+                                   transform=self.transforms,
+                                   tokenizer=None,
+                                   remap_labels=p['train_kwargs']['remap_seg'],
+                                   encoding_mode=p['train_kwargs']['encoding_mode'],
+                                   num_classes=p['num_classes'],
+                                   fill_value=p['fill_value'],
+                                   ignore_label=p['ignore_label'],
+                                   inpainting_strength=p['inpainting_strength'])
+        self.ds_val = self.get_dataset(p['val_db_name'],
+                                       split='val',
+                                       transform=self.transforms_val,
+                                       tokenizer=None,
+                                       remap_labels=p['train_kwargs']['remap_seg'],
+                                       encoding_mode=p['train_kwargs']['encoding_mode'],
+                                       num_classes=p['num_classes'],
+                                       fill_value=p['fill_value'],
+                                       ignore_label=p['ignore_label'],
+                                       inpainting_strength=p['inpainting_strength'])
         print(colored('The dataset contains {} samples'.format(len(self.ds)), 'blue'))
         if args['distributed']:
             self.train_sampler = DistributedSampler(self.ds)
@@ -173,10 +148,8 @@ class TrainerAE(DatasetBase):
         else:
             self.train_sampler = None
             self.val_sampler = None
-        
         # train loader
-        
-        self.dl = DataLoader(train_dataset,
+        self.dl = DataLoader(self.ds,
                              batch_size=self.batch_size,
                              num_workers=self.num_workers,
                              shuffle=(self.train_sampler is None),
@@ -186,7 +159,7 @@ class TrainerAE(DatasetBase):
                              collate_fn=collate_fn)
 
         # val loader
-        self.dl_val = DataLoader(train_dataset,
+        self.dl_val = DataLoader(self.ds_val,
                                  batch_size=self.batch_size,
                                  num_workers=self.num_workers,
                                  shuffle=(self.val_sampler is None),
@@ -270,13 +243,13 @@ class TrainerAE(DatasetBase):
 
     def train_single_epoch(self, epoch, meters_dict, progress, semseg_meter):
         """ Train the model for one epoch
-        """
-        self.vae_model.train()
+        """ 
+            
         total_loss = total_ce_loss = total_kl_loss = total_mask_loss = 0.
         for batch_idx, data in enumerate(self.dl):
 
             assert self.vae_model.training
-
+            
             # move data to gpu
             images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)
             targets = data['semseg'].cuda(self.args['gpu'], non_blocking=True)
@@ -317,13 +290,14 @@ class TrainerAE(DatasetBase):
                 total_ce_loss += (ce_loss / self.gradient_accumulate_every).detach()
                 total_kl_loss += (kl_loss / self.gradient_accumulate_every).detach()
                 total_mask_loss += (mask_loss / self.gradient_accumulate_every).detach()
-
+                
+                
             # update gradients
             if self.fp16_scaler is None:
                 loss.backward()
             else:
                 self.fp16_scaler.scale(loss).backward()
-
+            #print("finish_update gradients")
             # accumulate gradients
             if ((batch_idx + 1) % self.gradient_accumulate_every != 0) and (batch_idx + 1 != len(self.dl)):
                 continue
@@ -355,6 +329,7 @@ class TrainerAE(DatasetBase):
             # update meters
             torch.cuda.synchronize()
             loss_dict = {'loss': total_loss, 'ce': total_ce_loss, 'mask': total_mask_loss, 'kl': total_kl_loss}
+            #print(loss_dict)
             meters_dict = self.update_meters(loss_dict, meters_dict)
             # interpolate output for evaluation, slows down training
             if self.evaluate_trainset:
@@ -370,12 +345,12 @@ class TrainerAE(DatasetBase):
                 progress.display(batch_idx)
 
             if self.check_iter(batch_idx, epoch):
-                self.save_train_images(output, data, threshold_output=True, stack_images=True, epoch=epoch)
-
+                self.save_train_images(output, data, threshold_output=True, stack_images=True)
+            #print("finish one loop")
     def train_loop(self) -> None:
         """ Train the model for a given number of epochs
         """
-
+        
         start_training_time = time.time()
 
         # first compute metrics
@@ -408,7 +383,7 @@ class TrainerAE(DatasetBase):
             )
             log_dict = {}
             meters_dict = {"loss": losses, "ce": ce_losses, "mask": mask_losses, "kl": kl_losses}
-
+        
             # randomize sampler
             if self.args['distributed']:
                 self.dl.sampler.set_epoch(epoch)
@@ -451,7 +426,6 @@ class TrainerAE(DatasetBase):
         # compute metrics at the end of training
         self.compute_metrics(['miou', 'pq'], threshold_output=True, save_images=True)
         print(f"Finished run {self.p['name']} and took {str(timedelta(seconds=time.time()-start_training_time))}")
-       
 
     def update_meters(self, loss_dict: dict, meter_dict: dict, size: int = 1) -> dict:
         loss_dict = {name: gpu_gather(val.repeat(size)).mean().item() for name, val in loss_dict.items()}
@@ -579,33 +553,23 @@ class TrainerAE(DatasetBase):
     ):
         """ Compute different metrics on the validation set
             NOTE: some variability is to be expected due to the random assignment of label ids.
-            这段代码是评估COCO的
         """
 
-#         assert isinstance(names, str) or isinstance(names, list)
+        assert isinstance(names, str) or isinstance(names, list)
 
-#         if not isinstance(names, list):
-#             names = [names]
+        if not isinstance(names, list):
+            names = [names]
 
-#         for name in names:
-#             if name.lower() == 'miou':
-#                 self.compute_miou(threshold_output=threshold_output, save_images=save_images)
-#             elif name.lower() == 'pq':
-#                 self.compute_pq(threshold_output=threshold_output, save_images=save_images)
-#             else:
-#                 raise NotImplementedError(f'Unknown metric {name}')
+        for name in names:
+            if name.lower() == 'miou':
+                self.compute_miou(threshold_output=threshold_output, save_images=save_images)
+            elif name.lower() == 'pq':
+                self.compute_pq_kitti(threshold_output=threshold_output, save_images=save_images)
+            else:
+                raise NotImplementedError(f'Unknown metric {name}')
 
-#             dist.barrier()
-        """ Compute different metrics on the validation set
-            NOTE: some variability is to be expected due to the random assignment of label ids.
-            这段代码是评估KITTI的
-        """
-       
-        metrics = self.compute_kitti_metrics(threshold_output=threshold_output, save_images=save_images)
-        return metrics
-        
-            
-            
+            dist.barrier()
+
     def crop_padding(self, prediction: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
         # TODO handle this in a nicer way by loading the coordinates in the dataloader
         padding_co = padding_mask.nonzero()
@@ -613,6 +577,50 @@ class TrainerAE(DatasetBase):
         x_min, x_max = padding_co[:, 1].min(), padding_co[:, 1].max()
         prediction = prediction[:, y_min:y_max + 1, x_min:x_max + 1]
         return prediction
+    @torch.no_grad()
+    def compute_pq_kitti(self, threshold_output=True, save_images=False):
+        """
+        针对 KITTI 数据集计算全景质量（PQ）
+          1. 将模型置于评估模式
+          2. 对验证集中的每个 batch：
+               - 对图像输入（image_semseg）归一化处理后，执行模型预测，
+                 并用 argmax 得到预测的单通道全景分割图（假设输出通道对应类别概率）。
+               - 对于 batch 中的每张图像，提取 GT 的语义分割（'semseg'）和实例分割（'instance'），
+                 转换为 numpy 数组（注意数据类型转换），
+                 调用 evaluator.add_image(pred, gt_semseg, gt_instance) 累积评价统计。
+          3. 遍历完所有 batch 后，通过 evaluator.evaluate() 输出 PQ、SQ、RQ 等指标。
+        """
+        self.vae_model.eval()
+        evaluator = PanopticEvaluatorKITTI(
+            iou_thresh=0.5,
+            thing_ids={10, 11, 12, 13, 14, 15, 16, 17},
+            ignore_label=self.ds_val.ignore_label  # 常设为 0
+        )
+        
+        for batch_idx, data in tqdm(enumerate(self.dl_val), total=len(self.dl_val)):
+            # 获取经过预处理的输入图像（例如 image_semseg 经过归一化）
+            images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)
+            # 假设输入已归一化为 [-1,1]，否则可按 2*x-1 处理
+            images = 2. * images - 1.
+            target_size = data['semseg'][0].shape
+            # 模型推理：得到预测 logits（形状 (B, C, H, W)）
+            output = self.vae_model(images, sample_posterior=False)
+            output = F.interpolate(output.sample, size=target_size, mode="bilinear", align_corners=False)
+            # 对输出使用 argmax 获得预测分割（形状 (B, H, W)）
+            pred_seg = torch.argmax(output, dim=1).cpu().numpy()
+
+            batch_size = pred_seg.shape[0]
+            for i in range(batch_size):
+                # 获取 GT 的语义与实例分割，转换为 numpy 数组（保证为 int32 类型）
+                gt_semseg = data['semseg'][i].cpu().numpy().astype(np.int32)
+                gt_instance = data['instance'][i].cpu().numpy().astype(np.int32)
+                # 更新评价器（内部会先合并 semseg 与 instance，再计算匹配 IoU）
+                evaluator.add_image(pred_seg[i], gt_semseg, gt_instance)
+
+        results = evaluator.evaluate()
+        print("KITTI 全景评价结果：", results)
+        self.vae_model.train()
+        return results
 
     @torch.no_grad()
     def compute_pq(
@@ -626,7 +634,7 @@ class TrainerAE(DatasetBase):
         """
 
         from ldmseg.evaluations import PanopticEvaluatorAgnostic
-
+        
         meta_data = self.ds_val.meta_data
         evaluator = PanopticEvaluatorAgnostic(meta=meta_data)
         evaluator.reset()
@@ -717,18 +725,16 @@ class TrainerAE(DatasetBase):
         self.vae_model.train()
         return
 
-   
     @torch.no_grad()
-    def save_train_images(self, output: dict, data: dict, threshold_output: bool = False, stack_images: bool = False,epoch: int = None):
-        """ Sava images during training for visualization """
+    def save_train_images(self, output: dict, data: dict, threshold_output: bool = False, stack_images: bool = False):
+        """ Saves images during training
+        """
         if not is_main_process():
             return
 
-        # 获取 ground truth（单通道标签）和 RGB 图像（已归一化，范围[-1,1]）
         targets = data['semseg'].numpy()
+        pap_gts = data['image_semseg'].numpy()
         rgbs = (data['image'].numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
-
-        # 对输出进行上采样，使之与 targets 形状一致
         output.sample = F.interpolate(output.sample, size=targets.shape[-2:], mode='bilinear', align_corners=True)
         preds = torch.argmax(output.sample, dim=1)
 
@@ -738,53 +744,37 @@ class TrainerAE(DatasetBase):
             preds[probs < self.mask_th] = self.ds.ignore_label
 
         predictions = preds.cpu().numpy()
-        # 编码（彩色）标签
         predictions = self.encode_seg(predictions).astype(np.uint8)
         targets = self.encode_seg(targets).astype(np.uint8)
-        masks = (data['mask'].unsqueeze(1).repeat(1, 3, 1, 1).numpy()
-                 .transpose(0, 2, 3, 1) * 255).astype(np.uint8)
-
-        # 以预测结果的尺寸作为统一尺寸
-        common_height = predictions.shape[1]
-        common_width = predictions.shape[2]
-        # 根据宽度计算偏移量（比如2%）
-        offset = int(0.02 * common_width)
+        pap_gts = pap_gts.astype(np.uint8)
+        masks = (data['mask'].unsqueeze(1).repeat(1, 3, 1, 1).numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+        size = predictions.shape[1]
+        offset = int(0.02 * size)
         max_size = 10
         bs = min(predictions.shape[0], max_size)
-
-        # 分配拼接图像数组，注意宽度：bs*(common_width+offset)
-        pred_array = np.zeros((common_height, bs * (common_width + offset), 3), dtype=np.uint8)
-        gt_array   = np.zeros((common_height, bs * (common_width + offset), 3), dtype=np.uint8)
-        rgb_array  = np.zeros((common_height, bs * (common_width + offset), 3), dtype=np.uint8)
-        mask_array = np.zeros((common_height, bs * (common_width + offset), 3), dtype=np.uint8)
-
+        pred_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
+        gt_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
+        rgb_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
+        mask_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
+        panpotic_array= np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
         ptr = 0
-        # 遍历每个样本，并将各个图像调整为相同尺寸后复制到对应位置
-        for j, (semseg, target, rgb, mask) in enumerate(zip(predictions, targets, rgbs, masks)):
-            # 若图像尺寸不同则进行调整
-            if semseg.shape[0] != common_height or semseg.shape[1] != common_width:
-                semseg = cv2.resize(semseg, (common_width, common_height), interpolation=cv2.INTER_NEAREST)
-            if target.shape[0] != common_height or target.shape[1] != common_width:
-                target = cv2.resize(target, (common_width, common_height), interpolation=cv2.INTER_NEAREST)
-            if rgb.shape[0] != common_height or rgb.shape[1] != common_width:
-                rgb = cv2.resize(rgb, (common_width, common_height), interpolation=cv2.INTER_LINEAR)
-            if mask.shape[0] != common_height or mask.shape[1] != common_width:
-                mask = cv2.resize(mask, (common_width, common_height), interpolation=cv2.INTER_NEAREST)
-
-            pred_array[:, ptr:ptr + common_width, :] = semseg
-            gt_array[:, ptr:ptr + common_width, :] = target
-            rgb_array[:, ptr:ptr + common_width, :] = rgb
-            mask_array[:, ptr:ptr + common_width, :] = mask
-            ptr += common_width + offset
+        for j, (semseg, target, rgb, mask,pap_gt) in enumerate(zip(predictions, targets, rgbs, masks,pap_gts)):
+            print(semseg.shape,target.shape,rgb.shae,mask.shape)
+            print(pred_array.shape,gt_array.shape,rgb_array.shae,mask_array.shape)
+            pred_array[:, ptr:ptr+size, :] = semseg
+            gt_array[:, ptr:ptr+size, :] = target
+            rgb_array[:, ptr:ptr+size, :] = rgb
+            mask_array[:, ptr:ptr+size, :] = mask
+            panpotic_array[:, ptr:ptr+size, :] = pap_gt
+            ptr += size + offset
             if j == max_size - 1:
                 break
-
         if stack_images:
-            stacked_image = np.vstack([rgb_array, gt_array, pred_array, mask_array])
-            self.write_images(stacked_image, str(epoch)+'rgb_gt_pred_ae_train.jpg')
+            self.write_images(np.vstack([rgb_array, gt_array, pred_array, mask_array, panpotic_array]), 'rgb_gt_pred_ae_train.jpg')
         else:
             self.write_images([pred_array, gt_array, rgb_array],
-                              [str(epoch)+'pred_ae_train.png', str(epoch)+'gt_ae_train.png', str(epoch)+'rgb_ae_train.jpg'])
+                              ['pred_ae_train.png', 'gt_ae_train.png', 'rgb_ae_train.jpg'])
+
     @torch.no_grad()
     def compute_miou(self, threshold_output=False, stack_images=True, save_images=False):
         """
@@ -801,7 +791,7 @@ class TrainerAE(DatasetBase):
                                    has_bg=False,
                                    ignore_index=self.ds.ignore_label,
                                    gpu_idx=self.args['gpu'])
-        
+
         for batch_idx, data in tqdm(enumerate(self.dl_val)):
             images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)
             targets = data['semseg'].cuda(self.args['gpu'], non_blocking=True)
@@ -831,26 +821,24 @@ class TrainerAE(DatasetBase):
                 masks = (data['mask'].unsqueeze(1).repeat(1, 3, 1, 1).numpy().transpose(0, 2, 3, 1) * 255
                          ).astype(np.uint8)
                 size = predictions.shape[1]
+                size_0 = predictions.shape[0]
+                size_2 = predictions.shape[2]
+                
                 offset = int(0.02 * size)
                 max_size = 10
                 bs = min(predictions.shape[0], max_size)
-                pred_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
-                gt_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
-                rgb_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
-                mask_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
+                pred_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
+                gt_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
+                rgb_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
+                mask_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
                 ptr = 0
 
                 for j, (semseg, target, rgb, mask) in enumerate(zip(predictions, targets, rgbs, masks)):
-                    semseg_resized = cv2.resize(semseg, (size, size), interpolation=cv2.INTER_NEAREST)
-                    target_resized = cv2.resize(target, (size, size), interpolation=cv2.INTER_NEAREST)
-                    rgb_resized = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_CUBIC)
-                    mask_resized = cv2.resize(mask, (size, size), interpolation=cv2.INTER_NEAREST)
-                    
-                    mask_array[:, ptr:ptr+size, :] = mask_resized
-                    pred_array[:, ptr:ptr+size, :] = semseg_resized
-                    gt_array[:, ptr:ptr+size, :] = target_resized
-                    rgb_array[:, ptr:ptr+size, :] = rgb_resized
-                    ptr += size + offset
+                    mask_array[:, ptr:ptr+size_2, :] = mask
+                    pred_array[:, ptr:ptr+size_2, :] = semseg
+                    gt_array[:, ptr:ptr+size_2, :] = target
+                    rgb_array[:, ptr:ptr+size_2, :] = rgb
+                    ptr += size_2 + offset
                     if j == max_size - 1:
                         break
                 if stack_images:
@@ -919,85 +907,3 @@ class TrainerAE(DatasetBase):
         key = f'panoptic_overlay{identifier}.jpg'
         self.write_images(panoptic_overlay_array, key)
         return
-
-    @torch.no_grad()
-    def compute_kitti_metrics(self, threshold_output: bool = True, save_images: bool = False):
-        """
-        针对 KITTI 数据集进行评价。
-        该函数假设：
-          - 预测的全景分割编码为整数张量 pred, 形状 (B, H, W)，
-            编码规则：pred = (pred_cat * MAX_INS + pred_ins)，其中 pred_cat 为类别 id（应在有效类别范围内）
-          - Ground truth 采用同样编码规则，由数据集在 __getitem__ 中返回（存于 meta 字典中），
-            键分别为 "gt_cat" 和 "gt_ins"，ground truth 编码 = gt_cat * MAX_INS + gt_ins。
-
-        本函数先从 DataLoader 中收集所有预测和 ground truth，
-        然后对每张图像调用 vpq_eval() 得到各类别的统计数据，最终累加计算 SQ、RQ、PQ。
-        """
-        # 固定参数：instance 部分用6位编码，即MAX_INS = 2**6 = 64
-        MAX_INS = 64
-        # 对于 KITTI，我们认为评价时有效类别为：
-        # [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
-        VALID_CAT_IDS = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
-        NUM_EVAL_CAT = len(VALID_CAT_IDS)  # 20个类别
-        # 构造连续映射：dataset类别 id -> 连续索引（0 ~ 19）
-        EVAL_MAPPING = {cat_id: idx for idx, cat_id in enumerate(VALID_CAT_IDS)}
-        self.vae_model.eval()
-        all_pred = []
-        all_gt = []
-        for batch in tqdm(self.dl_val, desc="KITTI Eval"):
-            images = batch['image_semseg'].cuda(self.args['gpu'], non_blocking=True)
-            rgbs = None
-            if self.fuse_rgb:
-                rgbs = batch['image'].cuda(self.args['gpu'], non_blocking=True)
-                rgbs = 2. * rgbs - 1.
-            output = self.vae_model(images, sample_posterior=False, rgb_sample=rgbs)
-            # 假设模型输出 output.sample 的形状为 [B, C, H, W]
-            # 如果模型输出通道数大于 11，则只取前 11 个通道作为 bit 编码
-            pred_bits = (output.sample[:, :11, :, :] > 0).long()  # [B, 11, H, W]
-            B, C, H, W = pred_bits.shape
-            # 向量化还原
-            factors = (2 ** torch.arange(C, dtype=torch.int64, device=pred_bits.device)).view(1, C, 1, 1)
-            pred_panoptic = (pred_bits * factors).sum(dim=1)  # [B, H, W]
-            pred_cat = pred_panoptic // MAX_INS
-            pred_ins = pred_panoptic % MAX_INS
-            pred_int = pred_cat * MAX_INS + pred_ins
-            all_pred.append(pred_int.cpu().numpy())
-
-            # ground truth：从 meta 字典中提取 "gt_cat" 和 "gt_ins"，并叠加得到整数编码
-            gt_cat = torch.stack([m['gt_cat'] for m in batch['meta']]).cuda(self.args['gpu'], non_blocking=True)
-            gt_ins = torch.stack([m['gt_ins'] for m in batch['meta']]).cuda(self.args['gpu'], non_blocking=True)
-            gt_int = gt_cat * MAX_INS + gt_ins
-            # 如果尺寸不匹配，则对 ground truth 进行 resize（这里使用最近邻插值）
-            pred_shape = pred_int.shape[1:]
-            if gt_int.shape[1:] != pred_shape:
-                gt_int_np = gt_int.cpu().numpy()
-                gt_int_resized = []
-                for i in range(gt_int_np.shape[0]):
-                    resized = cv2.resize(gt_int_np[i], (pred_shape[1], pred_shape[0]), interpolation=cv2.INTER_NEAREST)
-                    gt_int_resized.append(resized)
-                gt_int = torch.tensor(np.stack(gt_int_resized), device=gt_int.device, dtype=gt_int.dtype)
-            all_gt.append(gt_int.cpu().numpy())
-
-        all_pred = np.concatenate(all_pred, axis=0)
-        all_gt = np.concatenate(all_gt, axis=0)
-
-        # 对每张图像进行 VPQ 评估
-        sum_iou = np.zeros(NUM_EVAL_CAT, dtype=np.float64)
-        sum_tp = np.zeros(NUM_EVAL_CAT, dtype=np.float64)
-        sum_fn = np.zeros(NUM_EVAL_CAT, dtype=np.float64)
-        sum_fp = np.zeros(NUM_EVAL_CAT, dtype=np.float64)
-        num_images = all_pred.shape[0]
-        for i in range(num_images):
-            result = vpq_eval([all_pred[i], all_gt[i]], num_cat=NUM_EVAL_CAT)
-            sum_iou += result[0]
-            sum_tp += result[1]
-            sum_fn += result[2]
-            sum_fp += result[3]
-        epsilon = 1e-8
-        sq = sum_iou / (sum_tp + epsilon)
-        rq = sum_tp / (sum_tp + 0.5 * (sum_fn + sum_fp) + epsilon)
-        pq = sq * rq
-
-        print("KITTI Evaluation Results:")
-        print("Mean PQ: {:.2f}%, Mean SQ: {:.2f}%, Mean RQ: {:.2f}%".format(pq.mean()*100, sq.mean()*100, rq.mean()*100))
-        return {"PQ": pq.mean()*100, "SQ": sq.mean()*100, "RQ": rq.mean()*100}

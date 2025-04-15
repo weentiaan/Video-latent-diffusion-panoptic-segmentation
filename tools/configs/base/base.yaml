@@ -12,7 +12,7 @@ load_path:
 image_scaling_factor: 0.18215  # standard SD scaling factor
 shared_vae_encoder: False
 vae_model_kwargs:
-   in_channels: 7  # consider bit encoding
+   in_channels: 7   # consider bit encoding
    int_channels: 256
    out_channels: 128
    block_out_channels: [32, 64, 128, 256]

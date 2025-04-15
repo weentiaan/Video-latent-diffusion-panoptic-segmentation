@@ -3,7 +3,7 @@ BS=${1-8}
 
 export OMP_NUM_THREADS=1
 python -W ignore tools/main_ae.py \
-    datasets=coco \
+    datasets=kitti \
     debug=$DEBUG \
     base.wandb=False \
     base.train_kwargs.batch_size=$BS \
