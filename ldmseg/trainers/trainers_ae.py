@@ -202,8 +202,8 @@ class TrainerAE(DatasetBase):
         self.evaluate_trainset = False
 
     def compute_point_loss(self, outputs, targets, do_matching=False, masks=None):
-        posterior = outputs.posterior
-        outputs = outputs.sample
+        posterior = outputs.posterior#概率分布
+        outputs = outputs.sample#预测值
 
         # (1) compute segmentation losses (ce + mask)
         losses = self.segmentation_losses.point_loss(outputs, targets, do_matching, masks)
@@ -251,10 +251,14 @@ class TrainerAE(DatasetBase):
             assert self.vae_model.training
             
             # move data to gpu
-            images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)
-            targets = data['semseg'].cuda(self.args['gpu'], non_blocking=True)
+            
+            # images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)#[bit,h,w]
+            # targets = data['semseg'].cuda(self.args['gpu'], non_blocking=True)#[3,h,w]
+            # images = 2. * images - 1.
+            images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)#[bit,h,w]
+            targets = data['target'].cuda(self.args['gpu'], non_blocking=True)#[3,h,w]
             images = 2. * images - 1.
-
+            
             # move rgb to gpu if needed
             rgbs = None
             if self.fuse_rgb:
@@ -274,7 +278,7 @@ class TrainerAE(DatasetBase):
             latent_mask = None
             if self.latent_mask:
                 latent_mask = self.get_loss_weight_mask(
-                    data['semseg'],
+                    data['target'],
                     mode='nearest',
                     device=self.args['gpu'],
                     size=(self.latent_size, self.latent_size),

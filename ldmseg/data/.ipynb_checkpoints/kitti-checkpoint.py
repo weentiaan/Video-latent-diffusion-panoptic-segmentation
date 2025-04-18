@@ -412,17 +412,8 @@ class KITTI(data.Dataset):
         
         
         
-        colormap = get_color_map(50)
-        if self.encoding_mode == 'random_color':
-            pop=(sample['semseg']*1000+sample['instance']*10)*sample['mask']
-            color_image = colorize_panoptic(pop, colormap)
-            sample['image_semseg'] = color_image
-            sample['image_semseg'] = Image.fromarray(sample['image_semseg'])
-        elif self.encoding_mode == 'color':
-            pop=(sample['semseg']**1000+sample['instance']*10)*sample['mask']
-            color_image = colorize_panoptic(pop, colormap)
-            sample['image_semseg'] = color_image
-            sample['image_semseg'] = Image.fromarray(sample['image_semseg'])
+        colormap = get_color_map(20)
+        
         # ---------- 8. 根据 encoding_mode 后处理 image_semseg ----------
         if self.encoding_mode == 'bits':
             
@@ -444,8 +435,20 @@ class KITTI(data.Dataset):
                                               truncation=True,
                                               return_tensors='pt').input_ids.squeeze(0)
         assert 'instance' in sample, "Missing instance segmentation in sample"
-        print("torch.unique(sample['semseg'])")
-        print(torch.unique(sample['semseg']))
+        
+        pop=(sample['semseg'].byte()*100+sample['instance'].byte())
+        print(pop.shape)
+        color_image = colorize_panoptic(pop, colormap)
+        print(color_image.shape)
+        img_tensor = torch.tensor(color_image, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+        print(img_tensor.shape)
+        pooled_tensor = max_pool(max_pool(max_pool(img_tensor)))
+        print(pooled_tensor.shape)
+        pooled_image = pooled_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        print(pooled_image.shape)
+        sample['target'] = Image.fromarray(pooled_image)
+        sample['target']=self.transform(sample['target'])
+        print(sample['target'].shape)
         return sample
 
 
@@ -496,7 +499,7 @@ if __name__ == '__main__':
         remap_labels=False,
         encoding_mode="bits"
     )
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=2)
 
     # 只取第一个 batch
     sample = next(iter(dataloader))
@@ -542,7 +545,8 @@ if __name__ == '__main__':
     print(np.unique(pooled_image))
     img = Image.fromarray(pooled_image).save(os.path.join(out_dir, 'image_semseg.png'))
    
-    
+    print(sample['target'][0].shape)
+    img = Image.fromarray(((sample['target'][0] * std + mean).clamp(0,1) * 255).permute(1, 2, 0).cpu().numpy().astype(np.uint8)  ).save(os.path.join(out_dir, 'target.png'))
     # 5) 保存 instance map
     inst = sample['instance'][0].cpu().numpy().astype(np.uint8)
     Image.fromarray(inst).save(os.path.join(out_dir, 'instance.png'))
