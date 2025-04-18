@@ -13,28 +13,41 @@ from typing import Optional, Tuple, Any
 import random
 from collections import defaultdict
 import torchvision.transforms as T
-
+import torch.nn as nn
 from ldmseg.data.util.mypath import MyPath
 from ldmseg.utils.utils import color_map
 from ldmseg.data.util.mask_generator import MaskingGenerator
-
+max_pool = nn.MaxPool2d(kernel_size=2, stride=1,padding=1)
 # ----------------- 辅助函数 -----------------
-
 def get_color_map(num_colors):
-    np.random.seed(42)
+    """
+    生成一个包含 num_colors 个随机颜色的映射表。
+    """
+    np.random.seed(20)  # 固定种子，保证每次生成相同的颜色
     return np.random.randint(0, 256, (num_colors, 3), dtype=np.uint8)
 
 def colorize_panoptic(panoptic_map, colormap):
-    h, w = panoptic_map.shape
-    color_image = np.zeros((h, w, 3), dtype=np.uint8)
+    """
+    根据 panoptic_map 中每个像素的 panoptic_id，从 colormap 中取对应颜色，
+    生成彩色图像。
+    """
+    
+    h,w=panoptic_map.shape
+    
+    color_image = np.zeros((h, w,3), dtype=np.uint8)
+    
     unique_ids = np.unique(panoptic_map)
+    
     for uid in unique_ids:
-        if uid == 255:
+        # 如果 uid 为 0 或 2550000，设定为黑色
+        if uid == 0:
             color = np.array([0, 0, 0], dtype=np.uint8)
         else:
+            # 使用 modulo 确保 uid 超过颜色数量时仍然可以映射
             color = colormap[uid % len(colormap)]
+        
         color_image[panoptic_map == uid] = color
-    return color_image
+    return color_image#[h,w,3]
 
 def encode_segmentation_mask(seg_img: np.ndarray, color_to_label: dict) -> np.ndarray:
     H, W = seg_img.shape
@@ -43,17 +56,6 @@ def encode_segmentation_mask(seg_img: np.ndarray, color_to_label: dict) -> np.nd
         mask = np.all(seg_img == np.array(color, dtype=np.uint8), axis=-1)
         label_map[mask] = label
     return label_map
-
-def encode_bitmap(x: torch.Tensor, n: int = 7, fill_value: float = 0.5):
-    """
-    将二维标签图 x (H, W) 进行 bit 编码，返回形状 (n, H, W) 的 Tensor 以及 ignore mask。
-    假设 ignore_label 为 0。
-    """
-    ignore_mask = x == 0
-    x = torch.bitwise_right_shift(x, torch.arange(n, device=x.device)[:, None, None])
-    x = torch.remainder(x, 2).float()
-    x[:, ignore_mask] = fill_value
-    return x, ignore_mask
 
 # ----------------- KITTI 数据集类 -----------------
 
@@ -69,10 +71,10 @@ class KITTI(data.Dataset):
         remap_labels: bool = False,
         caption_dropout: float = 0.0,
         overfit: bool = False,
-        encoding_mode: str = 'color',   # 'color', 'random_color', 'bits', 'none'
+        encoding_mode: str = 'bits',   # 'color', 'random_color', 'bits', 'none'
         caption_type: str = 'none',     # 'none', 'caption', 'class_label', 'blip'
         inpaint_mask_size: Optional[Tuple[int]] = None,
-        num_classes: int = 6,
+        num_classes: int = 30,
         fill_value: int = 0.5,
         ignore_label: int = 0,
         inpainting_strength: float = 0.0,
@@ -122,6 +124,7 @@ class KITTI(data.Dataset):
         T.Normalize(mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225])
     ])
+        
         self.root = prefix
         self.prefix = prefix
         valid_splits = ['train', 'val', 'test']
@@ -196,7 +199,36 @@ class KITTI(data.Dataset):
         else:
             self.pixel_threshold = 0
             self.training = False
+    def get_color_map(num_colors):
+        """
+        生成一个包含 num_colors 个随机颜色的映射表。
+        """
+        np.random.seed(42)  # 固定种子，保证每次生成相同的颜色
+        return np.random.randint(0, 256, (num_colors, 3), dtype=np.uint8)
 
+    def colorize_panoptic(panoptic_map, colormap):
+        """
+        根据 panoptic_map 中每个像素的 panoptic_id，从 colormap 中取对应颜色，
+        生成彩色图像。
+        """
+        shape=panoptic_map.shape
+        h, w = shape[-2:]
+
+        color_image = np.zeros(shape, dtype=np.uint8)
+
+        unique_ids = np.unique(panoptic_map)
+        
+        for uid in unique_ids:
+            # 如果 uid 为 0 或 2550000，设定为黑色
+            if uid >= 1550:
+                color = np.array([0, 0, 0], dtype=np.uint8)
+            else:
+                # 使用 modulo 确保 uid 超过颜色数量时仍然可以映射
+                color = colormap[uid % len(colormap)]
+            cond= (panoptic_map == uid)
+            mask=cond.squeeze(1)
+            color_image[mask] = color
+        return color_image
     def __len__(self):
         return len(self.samples)
     def _remap_labels_fn(self, labels, max_val=None, keep_background_fixed=True):
@@ -256,19 +288,20 @@ class KITTI(data.Dataset):
         assert array_seg_t.max() < 256
         return array_seg_t
 
-    def encode_bitmap(self, x: torch.Tensor, n: int = 7, fill_value: float = 0.5):
+    def encode_bitmap(self, x: torch.Tensor, n: int = 5, fill_value: float = 0.5):
         ignore_mask = x == self.ignore_label
         x = torch.bitwise_right_shift(x, torch.arange(n, device=x.device)[:, None, None])  # shift with n bits
         x = torch.remainder(x, 2).float()                                                  # take modulo 2 to get 0 or 1
         x[:, ignore_mask] = fill_value                                                     # set invalid pixels to 0.5
         return x, ignore_mask
 
-    def decode_bitmap(self, x: torch.Tensor, n: int = 7):
+    def decode_bitmap(self, x: torch.Tensor, n: int = 5):
         x = (x > 0.).float()                                          # output between -1 and 1
         n = x.shape[0]                                                # number of channels = number of bits
         x = x * 2 ** torch.arange(n, device=x.device)[:, None, None]  # get the value of each bit
         x = torch.sum(x, dim=0)                                       # sum over bits (no keepdim!)
-        x = x.long()                                                  # cast to int64 (or long)
+        x = x.long()# cast to int64 (or long)
+        x[x==31]=0
         return x
 
     def get_inpainting_mask(self, strength=0.5):
@@ -291,12 +324,6 @@ class KITTI(data.Dataset):
         meta["panoptic_root"] = self.root
         return meta
 
-    def encode_bitmap(self, x: torch.Tensor, n: int = 7, fill_value: float = 0.5):
-        ignore_mask = x == self.ignore_label
-        x = torch.bitwise_right_shift(x, torch.arange(n, device=x.device)[:, None, None])
-        x = torch.remainder(x, 2).float()
-        x[:, ignore_mask] = fill_value
-        return x, ignore_mask
 
     def __getitem__(self, idx):
         sample = {}
@@ -314,28 +341,28 @@ class KITTI(data.Dataset):
 
         # ---------- 2. 处理 Ground Truth 标签 ----------
         # 语义标签：class.png，转换为单通道 GT。用 nearest 插值 resize 至 (640,192)
-        sem_img = Image.open(sample_paths['class']).convert('L')
+        sem_img = Image.open(sample_paths['class'])
         sem_img = sem_img.resize((640, 192), Image.NEAREST)
-        sem_np_color = np.array(sem_img, dtype=np.uint8)
-        sem_np = encode_segmentation_mask(sem_np_color, self.KITTI_COLOR_TO_LABEL)
+        sem_np = np.array(sem_img, dtype=np.uint8)
         # 返回为整数 Tensor（不做归一化），直接转换为 tensor
         sample['semseg'] = torch.from_numpy(sem_np).long()
 
         # 实例标签：instance.png，灰度加载，用 nearest 插值 resize
-        inst_img = Image.open(sample_paths['instance']).convert('L')
+        inst_img = Image.open(sample_paths['instance'])
         inst_img = inst_img.resize((640, 192), Image.NEAREST)
         inst_np = np.array(inst_img, dtype=np.uint8)
         
         # 深度图：depth.png，用 nearest 插值 resize；保持原有数值
         depth_img = Image.open(sample_paths['depth'])
-        depth_img = depth_img.resize((640, 192), Image.NEAREST)
+        depth_img = depth_img.resize((640, 192), Image.BILINEAR)
         # 如果深度图本身为单通道且保存数值，则直接转换为 tensor
         depth_np = np.array(depth_img, dtype=np.float32)  # 假定深度为 float32 数值
        
         # ---------- 3. 构造 mask ----------
-        mask_np = np.ones_like(sem_np, dtype=np.uint8) * 255
+        mask_np = np.ones_like(sem_np, dtype=np.uint8)
         sample['mask'] = torch.from_numpy(mask_np)  # 返回 shape (H, W)
-
+        sample['mask'][sem_np==0]=0 #去除0和255
+        sample['mask'][sem_np==255]=0
         # ---------- 4. 读取预生成的全景彩色图像 ----------
         # 从固定目录 "/root/autodl-tmp/pop_gt" 读取，文件名格式为 "{idx}_output.png"
         if self.split=="train":
@@ -345,7 +372,7 @@ class KITTI(data.Dataset):
         color_img = Image.open(pop_gt_path).convert('RGB')
         color_img = color_img.resize((640, 192), Image.BILINEAR)
         sample['image_semseg'] = T.ToTensor()(color_img)
-
+        
         # ---------- 5. 处理 depth 与 instance ----------
         sample['depth'] = torch.from_numpy(depth_np)
         sample['instance'] = torch.from_numpy(inst_np).long()
@@ -372,16 +399,43 @@ class KITTI(data.Dataset):
         sample['text'] = ""
         inpainting_mask = self.maskgenerator(t=self.inpainting_strength)
         sample['inpainting_mask'] = torch.from_numpy(inpainting_mask).bool()
-
+        
+        #---------- 8. bit编码或者color编码 ----------
+        sample['semseg'][sample['semseg']==0]=0
+        sample['semseg'][sample['semseg']==255]=0
+        unipe,count=torch.unique(sample['instance'],return_counts=True)
+        
+        j=0
+        for i in unipe:
+            sample['instance'][sample['instance']==i]=j
+            j=j+1
+        
+        
+        
+        colormap = get_color_map(50)
+        if self.encoding_mode == 'random_color':
+            pop=(sample['semseg']*1000+sample['instance']*10)*sample['mask']
+            color_image = colorize_panoptic(pop, colormap)
+            sample['image_semseg'] = color_image
+            sample['image_semseg'] = Image.fromarray(sample['image_semseg'])
+        elif self.encoding_mode == 'color':
+            pop=(sample['semseg']**1000+sample['instance']*10)*sample['mask']
+            color_image = colorize_panoptic(pop, colormap)
+            sample['image_semseg'] = color_image
+            sample['image_semseg'] = Image.fromarray(sample['image_semseg'])
         # ---------- 8. 根据 encoding_mode 后处理 image_semseg ----------
         if self.encoding_mode == 'bits':
-            sample_sem = torch.from_numpy(sem_np).long()
-            image_semseg_bits, _ = self.encode_bitmap(sample_sem, n=7, fill_value=self.fill_value)
-            sample['image_semseg'] = image_semseg_bits
+            
+            seg_bit, _ = self.encode_bitmap( sample['semseg'], n=5, fill_value=self.fill_value)
+            ins_bit, _ = self.encode_bitmap( sample['instance'], n=5, fill_value=self.fill_value)
+            
+            #print(seg_bit.unsqueeze(0).shape,ins_bit.unsqueeze(0).shape)
+            sample['image_semseg'] = torch.cat((seg_bit,ins_bit),0)
+           
         elif self.encoding_mode == 'none':
-            sample_sem = torch.from_numpy(sem_np).float()
-            sample['image_semseg'] = sample_sem.unsqueeze(0).repeat(3, 1, 1) / self.num_classes
-
+            
+            sample['image_semseg'] =  sample['image_semseg']
+        
         # ---------- 9. 如果提供 tokenizer，则 tokenization ----------
         if self.tokenizer is not None:
             sample['tokens'] = self.tokenizer(sample['text'],
@@ -390,13 +444,10 @@ class KITTI(data.Dataset):
                                               truncation=True,
                                               return_tensors='pt').input_ids.squeeze(0)
         assert 'instance' in sample, "Missing instance segmentation in sample"
+        print("torch.unique(sample['semseg'])")
+        print(torch.unique(sample['semseg']))
         return sample
 
-    def _load_img(self, index, mode='array'):
-        _img = Image.open(self.samples[index]['leftImg8bit']).convert('RGB')
-        if mode == 'pil':
-            return _img
-        return np.array(_img)
 
     def _load_semseg(self, index, mode='array'):
         sample_paths = self.samples[index]
@@ -426,7 +477,11 @@ class KITTI(data.Dataset):
 if __name__ == '__main__':
     import torchvision.transforms as T
     from torch.utils.data import DataLoader
-
+    from PIL import Image
+    import numpy as np
+    import os
+    num_colors = 20
+    colormap = get_color_map(num_colors)
     transforms = T.Compose([
         T.Resize((192, 640)),  # 对 image 使用 bilinear resize
         T.ToTensor(),
@@ -436,19 +491,76 @@ if __name__ == '__main__':
     dataset_root = '/root/autodl-tmp/video_sequence'
     dataset = KITTI(
         prefix=dataset_root,
-        split='val',
+        split='train',
         transform=transforms,
-        remap_labels=False
+        remap_labels=False,
+        encoding_mode="bits"
     )
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4)
-    for sample in dataloader:
-        print("image:", sample['image'].shape)
-        print("semseg:", sample['semseg'].shape if isinstance(sample['semseg'], torch.Tensor) else sample['semseg'].size())
-        print("mask:", sample['mask'].shape if isinstance(sample['mask'], torch.Tensor) else sample['mask'].size())
-        print("image_semseg:", sample['image_semseg'].shape)
-        print("depth:", sample['depth'].shape)
-        print("instance:", sample['instance'].shape)
-        print("meta:", sample['meta'])
-        print("text:", sample['text'])
-        print("inpainting_mask:", sample['inpainting_mask'].shape)
-        break
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+
+    # 只取第一个 batch
+    sample = next(iter(dataloader))
+
+    # 创建输出目录
+    out_dir = os.path.join(os.getcwd(), 'sample_outputs')
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 1) 保存原始 RGB image （先反 normalize，再转 PIL）
+    img = sample['image'][0]  # [3, H, W]
+    mean = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
+    std  = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
+    img = img * std + mean       # 反归一化
+    img = img.clamp(0,1) * 255   # [0,255]
+    img = img.byte().permute(1,2,0).cpu().numpy()
+    Image.fromarray(img).save(os.path.join(out_dir, 'image.png'))
+
+    # 2) 保存 semseg (类别标签) 为灰度图
+    sem = sample['semseg'][0].cpu().numpy()
+    Image.fromarray(sem.astype(np.uint8)).save(os.path.join(out_dir, 'semseg.png'))
+
+    # 3) 保存 mask 为灰度图
+    m = sample['mask'][0].cpu().numpy()
+    Image.fromarray(m.astype(np.uint8)).save(os.path.join(out_dir, 'mask.png'))
+    
+    # 4) 保存 image_semseg（预生成的彩色 panoptic） 
+    
+    seg = dataset.decode_bitmap(sample['image_semseg'][0,0:5,:,:],n = 5).cpu().numpy().astype(np.uint8)  # [3, H, W], 已经是 0～1 之间
+    print(np.unique(seg,return_counts=True))
+    instance = dataset.decode_bitmap(sample['image_semseg'][0,5:10,:,:],n = 5).cpu().numpy().astype(np.uint8) # [3, H, W], 已经是 0～1 之间
+    print(np.unique(instance,return_counts=True))
+    
+    pop=(seg*100+instance)
+    print(np.unique(pop,return_counts=True))
+    color_image = colorize_panoptic(pop, colormap)
+    print(np.unique(color_image,return_counts=True))
+    img_tensor = torch.tensor(color_image, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+    pooled_tensor = max_pool(max_pool(max_pool(img_tensor)))
+        
+        # 4. 转换回 NumPy 数组，并将通道维度移到最后，得到形状 (88, 620, 3)
+    pooled_image = pooled_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+    
+    print(np.unique(pooled_image))
+    img = Image.fromarray(pooled_image).save(os.path.join(out_dir, 'image_semseg.png'))
+   
+    
+    # 5) 保存 instance map
+    inst = sample['instance'][0].cpu().numpy().astype(np.uint8)
+    Image.fromarray(inst).save(os.path.join(out_dir, 'instance.png'))
+    
+    # 6) 保存 depth（这里直接存为 .npy，也可以归一化成灰度图保存）
+    depth = sample['depth'][0].cpu().numpy().astype(np.float32)
+    np.save(os.path.join(out_dir, 'depth.npy'), depth)
+
+#     print(f"Saved all samples to {out_dir}")
+#     for sample in dataloader:
+#         print("image:", sample['image'].shape)
+#         print("semseg:", sample['semseg'].shape if isinstance(sample['semseg'], torch.Tensor) else sample['semseg'].size())
+#         print("mask:", sample['mask'].shape if isinstance(sample['mask'], torch.Tensor) else sample['mask'].size())
+#         print("image_semseg:", sample['image_semseg'].shape)
+       
+#         print("depth:", sample['depth'].shape)
+#         print("instance:", sample['instance'].shape)
+#         print("meta:", sample['meta'])
+#         print("text:", sample['text'])
+#         print("inpainting_mask:", sample['inpainting_mask'].shape)
+#         break
