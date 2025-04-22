@@ -31,6 +31,7 @@ class SemsegMeter(object):
             self.tp[i_part] += torch.sum(tmp_gt & tmp_pred & valid).item()
             self.fp[i_part] += torch.sum(~tmp_gt & tmp_pred & valid).item()
             self.fn[i_part] += torch.sum(tmp_gt & ~tmp_pred & valid).item()
+            
 
     def reset(self):
         self.tp = [0] * self.num_classes

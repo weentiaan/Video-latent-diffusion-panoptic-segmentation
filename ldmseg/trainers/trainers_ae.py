@@ -37,7 +37,40 @@ from ldmseg.utils import (
     get_world_size
 )
 
-from ldmseg.evaluations import PanopticEvaluatorKITTI
+from ldmseg.evaluations import KITTIPanopticEvaluator
+ 
+def get_color_map(num_colors):
+    """
+    生成一个包含 num_colors 个随机颜色的映射表。
+    """
+    np.random.seed(20)  # 固定种子，保证每次生成相同的颜色
+    return np.random.randint(0, 256, (num_colors, 3), dtype=np.uint8)
+
+def colorize_panoptic(panoptic_map, colormap):
+    """
+    根据 panoptic_map 中每个像素的 panoptic_id，从 colormap 中取对应颜色，
+    生成彩色图像。
+    """
+
+    h,w=panoptic_map.shape
+
+    color_image = np.zeros((h, w,3), dtype=np.uint8)
+
+    unique_ids = np.unique(panoptic_map)
+
+    for uid in unique_ids:
+        # 如果 uid 为 0 或 2550000，设定为黑色
+        if uid == 0:
+            color = np.array([0, 0, 0], dtype=np.uint8)
+        else:
+            # 使用 modulo 确保 uid 超过颜色数量时仍然可以映射
+            color = colormap[uid % len(colormap)]
+
+        color_image[panoptic_map == uid] = color
+    return color_image#[h,w,3]
+
+
+
 class TrainerAE(DatasetBase):
 
     def __init__(
@@ -201,12 +234,12 @@ class TrainerAE(DatasetBase):
         self.loss_weights = self.p['loss_weights']
         self.evaluate_trainset = False
 
-    def compute_point_loss(self, outputs, targets, do_matching=False, masks=None):
+    def compute_point_loss(self, outputs, targets,instance, do_matching=False, masks=None):
         posterior = outputs.posterior#概率分布
         outputs = outputs.sample#预测值
 
         # (1) compute segmentation losses (ce + mask)
-        losses = self.segmentation_losses.point_loss(outputs, targets, do_matching, masks)
+        losses = self.segmentation_losses.point_loss(outputs, targets,instance, do_matching, masks)
 
         # (2) compute kl loss
         losses['kl'] = torch.mean(posterior.kl())
@@ -256,7 +289,8 @@ class TrainerAE(DatasetBase):
             # targets = data['semseg'].cuda(self.args['gpu'], non_blocking=True)#[3,h,w]
             # images = 2. * images - 1.
             images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)#[bit,h,w]
-            targets = data['target'].cuda(self.args['gpu'], non_blocking=True)#[3,h,w]
+            targets = data['semseg'].cuda(self.args['gpu'], non_blocking=True)#[3,h,w]
+            instance = data['instance'].cuda(self.args['gpu'], non_blocking=True)
             images = 2. * images - 1.
             
             # move rgb to gpu if needed
@@ -278,7 +312,7 @@ class TrainerAE(DatasetBase):
             latent_mask = None
             if self.latent_mask:
                 latent_mask = self.get_loss_weight_mask(
-                    data['target'],
+                    data['semseg'],
                     mode='nearest',
                     device=self.args['gpu'],
                     size=(self.latent_size, self.latent_size),
@@ -288,14 +322,15 @@ class TrainerAE(DatasetBase):
             # update loss
             with torch.autocast('cuda', enabled=self.fp16_scaler is not None):
                 output = self.vae_model(images, sample_posterior=True, rgb_sample=rgbs, valid_mask=latent_mask)
-                loss, ce_loss, kl_loss, mask_loss = self.compute_point_loss(output, targets, masks=masks)
+                loss, ce_loss, kl_loss, mask_loss = self.compute_point_loss(output, targets,instance, masks=masks)
                 loss = loss / self.gradient_accumulate_every
                 total_loss += loss.detach()
                 total_ce_loss += (ce_loss / self.gradient_accumulate_every).detach()
                 total_kl_loss += (kl_loss / self.gradient_accumulate_every).detach()
                 total_mask_loss += (mask_loss / self.gradient_accumulate_every).detach()
                 
-                
+            if batch_idx==99:
+                print(torch.unique(output.sample[0]),torch.unique(targets[0]))
             # update gradients
             if self.fp16_scaler is None:
                 loss.backward()
@@ -350,6 +385,7 @@ class TrainerAE(DatasetBase):
 
             if self.check_iter(batch_idx, epoch):
                 self.save_train_images(output, data, threshold_output=True, stack_images=True)
+            
             #print("finish one loop")
     def train_loop(self) -> None:
         """ Train the model for a given number of epochs
@@ -387,7 +423,7 @@ class TrainerAE(DatasetBase):
             )
             log_dict = {}
             meters_dict = {"loss": losses, "ce": ce_losses, "mask": mask_losses, "kl": kl_losses}
-        
+            
             # randomize sampler
             if self.args['distributed']:
                 self.dl.sampler.set_epoch(epoch)
@@ -426,7 +462,7 @@ class TrainerAE(DatasetBase):
             avg_time_per_epoch = (time.time() - start_training_time) / (epoch + 1 - self.start_epoch)
             eta = avg_time_per_epoch * (self.epochs - 1 - epoch)
             print(colored(f'ETA: {str(timedelta(seconds=eta ))}', 'yellow'))
-
+        print(meters_dict)
         # compute metrics at the end of training
         self.compute_metrics(['miou', 'pq'], threshold_output=True, save_images=True)
         print(f"Finished run {self.p['name']} and took {str(timedelta(seconds=time.time()-start_training_time))}")
@@ -595,10 +631,11 @@ class TrainerAE(DatasetBase):
           3. 遍历完所有 batch 后，通过 evaluator.evaluate() 输出 PQ、SQ、RQ 等指标。
         """
         self.vae_model.eval()
-        evaluator = PanopticEvaluatorKITTI(
-            iou_thresh=0.5,
+        evaluator = KITTIPanopticEvaluator(
+            iou_thr=0.5,
             thing_ids={10, 11, 12, 13, 14, 15, 16, 17},
-            ignore_label=self.ds_val.ignore_label  # 常设为 0
+            ignore_label=self.ds_val.ignore_label,
+            num_semantic_cls=30
         )
         
         for batch_idx, data in tqdm(enumerate(self.dl_val), total=len(self.dl_val)):
@@ -619,7 +656,7 @@ class TrainerAE(DatasetBase):
                 gt_semseg = data['semseg'][i].cpu().numpy().astype(np.int32)
                 gt_instance = data['instance'][i].cpu().numpy().astype(np.int32)
                 # 更新评价器（内部会先合并 semseg 与 instance，再计算匹配 IoU）
-                evaluator.add_image(pred_seg[i], gt_semseg, gt_instance)
+                evaluator.add_sample(pred_seg[i], gt_semseg, gt_instance)
 
         results = evaluator.evaluate()
         print("KITTI 全景评价结果：", results)
@@ -728,6 +765,7 @@ class TrainerAE(DatasetBase):
 
         self.vae_model.train()
         return
+    
 
     @torch.no_grad()
     def save_train_images(self, output: dict, data: dict, threshold_output: bool = False, stack_images: bool = False):
@@ -753,24 +791,36 @@ class TrainerAE(DatasetBase):
         pap_gts = pap_gts.astype(np.uint8)
         masks = (data['mask'].unsqueeze(1).repeat(1, 3, 1, 1).numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
         size = predictions.shape[1]
+        size_2 = predictions.shape[2]
         offset = int(0.02 * size)
         max_size = 10
         bs = min(predictions.shape[0], max_size)
-        pred_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
-        gt_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
-        rgb_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
-        mask_array = np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
-        panpotic_array= np.zeros((size, bs * (size + offset), 3), dtype=np.uint8)
+        pred_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
+        gt_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
+        rgb_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
+        mask_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
+        panpotic_array= np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
         ptr = 0
+        colormap = get_color_map(20)
+        max_pool = nn.MaxPool2d(kernel_size=2, stride=1,padding=1)
         for j, (semseg, target, rgb, mask,pap_gt) in enumerate(zip(predictions, targets, rgbs, masks,pap_gts)):
-            print(semseg.shape,target.shape,rgb.shae,mask.shape)
-            print(pred_array.shape,gt_array.shape,rgb_array.shae,mask_array.shape)
-            pred_array[:, ptr:ptr+size, :] = semseg
-            gt_array[:, ptr:ptr+size, :] = target
-            rgb_array[:, ptr:ptr+size, :] = rgb
-            mask_array[:, ptr:ptr+size, :] = mask
-            panpotic_array[:, ptr:ptr+size, :] = pap_gt
-            ptr += size + offset
+            seg = self.ds.decode_bitmap(data['image_semseg'][j,0:5,:,:],n = 5).cpu().numpy().astype(np.uint8)  # [3, H, W], 已经是 0～1 之间
+            instance = self.ds.decode_bitmap(data['image_semseg'][j,5:10,:,:],n = 5).cpu().numpy().astype(np.uint8) # [3, H, W], 已经是 0～1 之间
+            pop=(seg*100+instance)
+            color_image = colorize_panoptic(pop, colormap)
+            img_tensor = torch.tensor(color_image, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+            pooled_tensor = max_pool(max_pool(max_pool(img_tensor)))
+                # 4. 转换回 NumPy 数组，并将通道维度移到最后，得到形状 (88, 620, 3)
+            pooled_tensor=F.interpolate(pooled_tensor, size=[size,size_2])
+
+            pooled_image = pooled_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+            
+            pred_array[:, ptr:ptr+size_2, :] = semseg
+            gt_array[:, ptr:ptr+size_2, :] = target
+            rgb_array[:, ptr:ptr+size_2, :] = rgb
+            mask_array[:, ptr:ptr+size_2, :] = mask
+            panpotic_array[:, ptr:ptr+size_2, :] = pooled_image
+            ptr += size_2 + offset
             if j == max_size - 1:
                 break
         if stack_images:
@@ -798,6 +848,7 @@ class TrainerAE(DatasetBase):
 
         for batch_idx, data in tqdm(enumerate(self.dl_val)):
             images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)
+            
             targets = data['semseg'].cuda(self.args['gpu'], non_blocking=True)
             images = 2. * images - 1.
             rgbs = None
@@ -807,18 +858,22 @@ class TrainerAE(DatasetBase):
             output = self.vae_model(images, sample_posterior=False, rgb_sample=rgbs)
 
             output.sample = F.interpolate(output.sample, size=targets.shape[-2:], mode='bilinear', align_corners=True)
+            
             preds = torch.argmax(output.sample, dim=1)
 
             if threshold_output:
                 probs = F.softmax(output.sample, dim=1)
                 probs = probs.max(dim=1)[0]
                 preds[probs < self.mask_th] = self.ds.ignore_label
+                
+           
             semseg_meter.update(preds, targets)
 
             # save images
             if save_images and batch_idx == 0 and is_main_process():
                 predictions = preds.cpu().numpy()
                 predictions = self.encode_seg(predictions).astype(np.uint8)
+                
                 targets = targets.cpu().numpy()
                 targets = self.encode_seg(targets).astype(np.uint8)
                 rgbs = (data['image'].numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
@@ -835,18 +890,33 @@ class TrainerAE(DatasetBase):
                 gt_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
                 rgb_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
                 mask_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
+                panpotic_array= np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
+                
                 ptr = 0
-
+                colormap = get_color_map(20)
+                max_pool = nn.MaxPool2d(kernel_size=2, stride=1,padding=1)
                 for j, (semseg, target, rgb, mask) in enumerate(zip(predictions, targets, rgbs, masks)):
+                    seg = self.ds.decode_bitmap(data['image_semseg'][j,0:5,:,:],n = 5).cpu().numpy().astype(np.uint8)  # [3, H, W], 已经是 0～1 之间
+                    instance = self.ds.decode_bitmap(data['image_semseg'][j,5:10,:,:],n = 5).cpu().numpy().astype(np.uint8) # [3, H, W], 已经是 0～1 之间
+                    pop=(seg*100+instance)
+                    color_image = colorize_panoptic(pop, colormap)
+                    img_tensor = torch.tensor(color_image, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+                    pooled_tensor = max_pool(max_pool(max_pool(img_tensor)))
+                        # 4. 转换回 NumPy 数组，并将通道维度移到最后，得到形状 (88, 620, 3)
+                    pooled_tensor=F.interpolate(pooled_tensor, size=[size,size_2])
+
+                    pooled_image = pooled_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+                    
                     mask_array[:, ptr:ptr+size_2, :] = mask
                     pred_array[:, ptr:ptr+size_2, :] = semseg
                     gt_array[:, ptr:ptr+size_2, :] = target
                     rgb_array[:, ptr:ptr+size_2, :] = rgb
+                    panpotic_array[:, ptr:ptr+size_2, :] = pooled_image
                     ptr += size_2 + offset
                     if j == max_size - 1:
                         break
                 if stack_images:
-                    self.write_images(np.vstack([rgb_array, gt_array, pred_array, mask_array]),
+                    self.write_images(np.vstack([rgb_array, gt_array, pred_array, mask_array,panpotic_array]),
                                       'rgb_gt_pred_ae_val.jpg')
                 else:
                     self.write_images([pred_array, gt_array, rgb_array],

@@ -19,7 +19,7 @@ class PanopticEvaluatorKITTI:
         self.thing_ids = thing_ids
         self.ignore_label = ignore_label
         # 用于区分类别内部不同实例的编码常数，一般取一个足够大的值
-        self.max_ins = 2 ** 20  # 约 1e6
+        self.max_ins = 50  # 约 1e6
         self.reset()
 
     def reset(self):
@@ -41,15 +41,15 @@ class PanopticEvaluatorKITTI:
         返回:
             panoptic: (H, W) 的 numpy 数组，合成后的全景 GT 编码
         """
-        semseg = semseg.astype(np.int32)
-        instance = instance.astype(np.int32)
+        semseg = semseg.astype(np.uint8)
+        instance = instance.astype(np.uint8)
         # 对于 thing 类别按照编码规则合并；否则直接用 semseg 值
         panoptic = np.where(np.isin(semseg, list(self.thing_ids)),
                             semseg * self.max_ins + instance,
                             semseg)
         # ignore 部分统一设置为 -1
         panoptic[semseg == self.ignore_label] = -1
-        return panoptic
+        return panoptic.astype(np.uint8)
 
     def _compute_iou(self, mask1, mask2):
         """

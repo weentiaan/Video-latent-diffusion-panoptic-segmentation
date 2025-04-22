@@ -12,7 +12,7 @@ load_path:
 image_scaling_factor: 0.18215  # standard SD scaling factor
 shared_vae_encoder: False
 vae_model_kwargs:
-   in_channels: 7   # consider bit encoding
+   in_channels: 10   # consider bit encoding
    int_channels: 256
    out_channels: 128
    block_out_channels: [32, 64, 128, 256]
@@ -80,10 +80,10 @@ train_kwargs:
    sample_posterior: False
    sample_posterior_rgb: False
    remap_seg: True
-   train_num_steps: 5000
-   batch_size: 8
+   train_num_steps: 35000
+   batch_size: 32
    accumulate: 1
-   num_workers: 2
+   num_workers: 8
    loss: l2
    ohem_ratio: 1.
    cudnn: False

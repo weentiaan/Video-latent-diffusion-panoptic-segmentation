@@ -175,12 +175,7 @@ class KITTI(data.Dataset):
                 typ = "depth"
             else:
                 continue
-            if self.split=="train":
-                if frame>="000005":
-                    continue
-            else:
-                if frame>="000100":
-                    continue
+            
             if scene not in sample_dict:
                 sample_dict[scene] = {}
             if frame not in sample_dict[scene]:
@@ -437,18 +432,18 @@ class KITTI(data.Dataset):
         assert 'instance' in sample, "Missing instance segmentation in sample"
         
         pop=(sample['semseg'].byte()*100+sample['instance'].byte())
-        print(pop.shape)
+        
         color_image = colorize_panoptic(pop, colormap)
-        print(color_image.shape)
+        
         img_tensor = torch.tensor(color_image, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
-        print(img_tensor.shape)
+       
         pooled_tensor = max_pool(max_pool(max_pool(img_tensor)))
-        print(pooled_tensor.shape)
+        
         pooled_image = pooled_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
-        print(pooled_image.shape)
+        
         sample['target'] = Image.fromarray(pooled_image)
         sample['target']=self.transform(sample['target'])
-        print(sample['target'].shape)
+       
         return sample
 
 

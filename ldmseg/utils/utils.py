@@ -265,7 +265,7 @@ def collate_fn(batch: dict):
     image_semseg = torch.stack([d['image_semseg'] for d in batch])
     instance = torch.stack([d['instance'] for d in batch])
     depth = torch.stack([d['depth'] for d in batch])
-    
+    target = torch.stack([d['target'] for d in batch])
     tokens = mask = inpainting_mask = text = meta = None
     if 'tokens' in batch[0]:
         tokens = torch.stack([d['tokens'] for d in batch])
@@ -287,7 +287,8 @@ def collate_fn(batch: dict):
         'tokens': tokens,
         'mask': mask,
         'inpainting_mask': inpainting_mask,
-        'image_semseg': image_semseg
+        'image_semseg': image_semseg,
+        'target':target
     }
 
 

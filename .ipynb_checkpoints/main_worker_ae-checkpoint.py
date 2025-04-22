@@ -104,8 +104,9 @@ def main_worker(gpu: int, ngpus_per_node: int, cfg_dist: dict, p: dict, name: st
         trainer.load(model_path=p['load_path'])
     if p.get('eval_only', False):
         trainer.compute_metrics(['miou', 'pq'])
-    else:
-        trainer.train_loop()
+        return
+    
+    trainer.train_loop()
 
     if p.get('wandb', False) and is_main_process():
         wandb.finish()

@@ -19,7 +19,7 @@ class PanopticEvaluatorKITTI:
         self.thing_ids = thing_ids
         self.ignore_label = ignore_label
         # 用于区分类别内部不同实例的编码常数，一般取一个足够大的值
-        self.max_ins = 2 ** 20  # 约 1e6
+        self.max_ins = 50  # 约 1e6
         self.reset()
 
     def reset(self):
