@@ -6,7 +6,9 @@ Licensed under the CC BY-NC 4.0 license (https://creativecommons.org/licenses/by
 """
 
 import os
+
 import sys
+sys.path.append("")
 import json
 import hydra
 import wandb

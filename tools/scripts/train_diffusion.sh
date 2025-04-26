@@ -4,7 +4,7 @@ ITERS=${2-90000}
 
 export OMP_NUM_THREADS=1
 python -W ignore tools/main_ldm.py \
-    datasets=coco \
+    datasets=kitti \
     debug=False \
     base.wandb=False \
     base.train_kwargs.train_num_steps=$ITERS \
@@ -14,7 +14,7 @@ python -W ignore tools/main_ldm.py \
     base.train_kwargs.gradient_checkpointing=True \
     base.train_kwargs.weight_dtype=float16 \
     base.train_kwargs.fp16=True \
-    base.vae_model_kwargs.pretrained_path='pretrained/ae.pt' \
+    base.vae_model_kwargs.pretrained_path='/root/autodl-tmp/Video-latent-diffusion-panoptic-segmentation/simple_diffusion/kitti/run_20250422_182259/model.pt' \
     base.vae_model_kwargs.parametrization=gaussian \
     base.vae_model_kwargs.num_upscalers=2 \
     base.vae_model_kwargs.num_mid_blocks=0 \

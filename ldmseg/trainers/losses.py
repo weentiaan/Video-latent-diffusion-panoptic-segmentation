@@ -125,7 +125,7 @@ class SegmentationLosses(nn.Module):
         Uncertainty loss for instance segmentation as used in Mask2Former: https://arxiv.org/abs/2112.01527
         Only minor modifications (i.e., simplified matching ids for ground truth and filtering of empty masks)
         """
-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
         # we first need to convert the targets to the format expected by the loss
         if indices is None:
             targets, indices = self.prepare_targets(targets,instance, ignore_label=self.ignore_label)
@@ -387,10 +387,10 @@ class SegmentationLosses(nn.Module):
             indices = self.matcher(outputs, targets)
         
         # (1) ce loss on uncertain regions
-        ce_loss = self.loss_ce(outputs, targets, indices=indices, masks=masks)
+        ce_loss = self.loss_ce(outputs[:,0:30,:,:], targets, indices=indices, masks=masks)
         
         # (2) bce + dice loss for uncertain regions per object mask
-        mask_loss = self.loss_masks(outputs, targets,instance, indices=indices)
+        mask_loss = self.loss_masks(outputs[:,30:60,:,:], targets,instance, indices=indices)
         losses = {'ce': ce_loss, 'mask': mask_loss}
 
         return losses

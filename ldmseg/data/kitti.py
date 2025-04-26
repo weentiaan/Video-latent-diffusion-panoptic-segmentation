@@ -60,26 +60,7 @@ def encode_segmentation_mask(seg_img: np.ndarray, color_to_label: dict) -> np.nd
 # ----------------- KITTI 数据集类 -----------------
 
 class KITTI(data.Dataset):
-     
-    def __init__(
-        self,
-        prefix: str,
-        split: str = 'train',
-        tokenizer: Optional[Any] = None,
-        transform: Optional[Any] = None,
-        download: bool = False,
-        remap_labels: bool = False,
-        caption_dropout: float = 0.0,
-        overfit: bool = False,
-        encoding_mode: str = 'bits',   # 'color', 'random_color', 'bits', 'none'
-        caption_type: str = 'none',     # 'none', 'caption', 'class_label', 'blip'
-        inpaint_mask_size: Optional[Tuple[int]] = None,
-        num_classes: int = 30,
-        fill_value: int = 0.5,
-        ignore_label: int = 0,
-        inpainting_strength: float = 0.0,
-    ):
-        KITTI_CATEGORIES = [
+    KITTI_CATEGORIES = [
         {"color": [0, 0, 0], "isthing": 0, "id": 0,  "name": "unlabeled"},
         {"color": [0, 0, 0], "isthing": 0, "id": 1,  "name": "outlier"},
         {"color": [0, 0, 142], "isthing": 1, "id": 10, "name": "car"},
@@ -102,8 +83,27 @@ class KITTI(data.Dataset):
         {"color": [0, 82, 0], "isthing": 0, "id": 27, "name": "trunk"},
         {"color": [120, 166, 157], "isthing": 0, "id": 28, "name": "terrain"},
         {"color": [110, 76, 0], "isthing": 0, "id": 29, "name": "sky"}]
-        self.KITTI_CATEGORY_NAMES = [cat["name"] for cat in KITTI_CATEGORIES]
-        self.KITTI_COLOR_TO_LABEL = {tuple(cat["color"]): idx for idx, cat in enumerate(KITTI_CATEGORIES)}
+    KITTI_CATEGORY_NAMES = [k["name"] for k in KITTI_CATEGORIES]
+    
+    def __init__(
+        self,
+        prefix: str,
+        split: str = 'train',
+        tokenizer: Optional[Any] = None,
+        transform: Optional[Any] = None,
+        download: bool = False,
+        remap_labels: bool = False,
+        caption_dropout: float = 0.0,
+        overfit: bool = False,
+        encoding_mode: str = 'bits',   # 'color', 'random_color', 'bits', 'none'
+        caption_type: str = 'none',     # 'none', 'caption', 'class_label', 'blip'
+        inpaint_mask_size: Optional[Tuple[int]] = None,
+        num_classes: int = 30,
+        fill_value: int = 0.5,
+        ignore_label: int = 0,
+        inpainting_strength: float = 0.0,
+    ):
+        
         """
         Args:
           prefix: 数据集根目录，例如 '/root/autodl-tmp/kitti'
@@ -176,13 +176,15 @@ class KITTI(data.Dataset):
             else:
                 continue
 
-            if self.split=="train":
-                if frame>="000020":
-                    continue
-            else:
-                if frame>="00050":
-                    continue
-
+            # if self.split=="train":
+            #     if frame>="000100":
+            #         continue
+            # else:
+            #     if frame>="00100":
+            #         continue
+            # if self.split=="val":
+            #     if frame>="000100":
+            #         continue
             if scene not in sample_dict:
                 sample_dict[scene] = {}
             if frame not in sample_dict[scene]:
@@ -193,8 +195,8 @@ class KITTI(data.Dataset):
                 if all(key in files for key in ['leftImg8bit', 'class', 'instance', 'depth']):
                     self.samples.append(files)
         print("Found {} samples in split {}".format(len(self.samples), split))
-        if overfit:
-            self.samples = self.samples[:1000]
+        
+
         if self.split == 'train':
             self.pixel_threshold = 10
             self.training = True
@@ -450,9 +452,57 @@ class KITTI(data.Dataset):
         
         sample['target'] = Image.fromarray(pooled_image)
         sample['target']=self.transform(sample['target'])
-       
+        
         return sample
+    def get_metadata(self):
+        meta = {}
+        # The following metadata maps contiguous id from [0, #thing categories +
+        # #stuff categories) to their names and colors. We have to replica of the
+        # same name and color under "thing_*" and "stuff_*" because the current
+        # visualization function in D2 handles thing and class classes differently
+        # due to some heuristic used in Panoptic FPN. We keep the same naming to
+        # enable reusing existing visualization functions.
+        thing_classes = [k["name"] for k in self.KITTI_CATEGORIES if k["isthing"] == 1]
+        thing_colors = [k["color"] for k in self.KITTI_CATEGORIES if k["isthing"] == 1]
+        stuff_classes = [k["name"] for k in self.KITTI_CATEGORIES]
+        stuff_colors = [k["color"] for k in self.KITTI_CATEGORIES]
 
+        meta["thing_classes"] = thing_classes
+        meta["thing_colors"] = thing_colors
+        meta["stuff_classes"] = stuff_classes
+        meta["stuff_colors"] = stuff_colors
+
+        # Convert category id for training:
+        #   category id: like semantic segmentation, it is the class id for each
+        #   pixel. Since there are some classes not used in evaluation, the category
+        #   id is not always contiguous and thus we have two set of category ids:
+        #       - original category id: category id in the original dataset, mainly
+        #           used for evaluation.
+        #       - contiguous category id: [0, #classes), in order to train the linear
+        #           softmax classifier.
+        thing_dataset_id_to_contiguous_id = {}
+        stuff_dataset_id_to_contiguous_id = {}
+        cat2name = {}
+
+        for i, cat in enumerate(self.KITTI_CATEGORIES):
+            if cat["isthing"]:
+                thing_dataset_id_to_contiguous_id[cat["id"]] = i
+            # else:
+            #     stuff_dataset_id_to_contiguous_id[cat["id"]] = i
+
+            # in order to use sem_seg evaluator
+            stuff_dataset_id_to_contiguous_id[cat["id"]] = i
+
+            cat2name[cat['id']] = cat['name']
+
+        meta["thing_dataset_id_to_contiguous_id"] = thing_dataset_id_to_contiguous_id
+        meta["stuff_dataset_id_to_contiguous_id"] = stuff_dataset_id_to_contiguous_id
+        meta["cat2name"] = cat2name
+
+        # meta["panoptic_json"] = self.panoptic_json
+        # meta["panoptic_root"] = self.panoptic_root
+
+        return meta
 
     def _load_semseg(self, index, mode='array'):
         sample_paths = self.samples[index]

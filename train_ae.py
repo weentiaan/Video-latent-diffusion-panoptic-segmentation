@@ -77,7 +77,7 @@ if __name__ == "__main__":
         cfg_dist['world_size'] = 1
         os.environ['CUDA_VISIBLE_DEVICES'] = '0'
         cfg_dataset['train_kwargs']['num_workers'] = 0
-        
+        cfg_dataset['eval_kwargs']['num_workers'] = 0
 
     ngpus_per_node = torch.cuda.device_count()
     # 根据 GPU 数量调整世界大小
@@ -86,7 +86,7 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------------
     # Step 6: 启动训练
-    cfg_dataset['train_kwargs']['train_num_steps']=5000
+    cfg_dataset['train_kwargs']['train_num_steps']=20000
     cfg_dataset['lr_scheduler_kwargs']['warmup_iters']=200
     if cfg.get('debug', True):
         # Debug 模式下直接调用 main_worker（单 GPU 单进程）

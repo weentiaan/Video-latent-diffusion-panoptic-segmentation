@@ -20,10 +20,11 @@ class DatasetBase(object):
         if p['type'] == 'crop_resize_pil':
             from .util import pil_transforms as pil_tr
             size = p['size']
+            size_2 = p['size_2']
             normalize = pil_tr.Normalize(**p['normalize_params']) if p['normalize'] else nn.Identity()
             transforms = T.Compose([
                 pil_tr.RandomHorizontalFlip() if p['flip'] else nn.Identity(),
-                pil_tr.CropResize((size, size), crop_mode=None),
+                pil_tr.CropResize((size, size_2), crop_mode=None),
                 pil_tr.ToTensor(),
                 normalize
             ])
@@ -37,9 +38,10 @@ class DatasetBase(object):
         if p['type'] in ['crop_resize_pil', 'random_crop_resize_pil']:
             from .util import pil_transforms as pil_tr
             size = p['size']
+            size_2 = p['size_2']
             normalize = pil_tr.Normalize(**p['normalize_params']) if p['normalize'] else nn.Identity()
             transforms = T.Compose([
-                pil_tr.CropResize((size, size), crop_mode=None),
+                pil_tr.CropResize((size, size_2), crop_mode=None),
                 pil_tr.ToTensor(),
                 normalize
             ])

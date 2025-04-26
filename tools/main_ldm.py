@@ -5,8 +5,9 @@ Main file for training diffusion models
 Licensed under the CC BY-NC 4.0 license (https://creativecommons.org/licenses/by-nc/4.0/)
 """
 
-import os
-import sys
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)+"/.."))
+
 import json
 import wandb
 import builtins

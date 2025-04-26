@@ -205,7 +205,7 @@ class TrainerAE(DatasetBase):
         self.results_folder.mkdir(exist_ok=True)
         self.visualization_dir = "visualizations"
         os.makedirs(self.visualization_dir, exist_ok=True)
-
+        print(colored('The dataset train {} samples'.format(len(self.dl)), 'blue'))
         # step counter state
         self.step = 0
         self.start_epoch = 0
@@ -632,13 +632,13 @@ class TrainerAE(DatasetBase):
         """
         self.vae_model.eval()
         evaluator = KITTIPanopticEvaluator(
-            iou_thr=0.5,
+            iou_thresh=0.5,
             thing_ids={10, 11, 12, 13, 14, 15, 16, 17},
             ignore_label=self.ds_val.ignore_label,
-            num_semantic_cls=30
+            max_ins=30
         )
         
-        for batch_idx, data in tqdm(enumerate(self.dl_val), total=len(self.dl_val)):
+        for batch_idx, data in tqdm(enumerate(self.dl_val)):
             # 获取经过预处理的输入图像（例如 image_semseg 经过归一化）
             images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)
             # 假设输入已归一化为 [-1,1]，否则可按 2*x-1 处理
@@ -648,15 +648,15 @@ class TrainerAE(DatasetBase):
             output = self.vae_model(images, sample_posterior=False)
             output = F.interpolate(output.sample, size=target_size, mode="bilinear", align_corners=False)
             # 对输出使用 argmax 获得预测分割（形状 (B, H, W)）
-            pred_seg = torch.argmax(output, dim=1).cpu().numpy()
-
+            pred_seg = torch.argmax(output[:,0:30,:,:], dim=1).cpu().numpy()
+            pred_ins = torch.argmax(output[:,30:60,:,:], dim=1).cpu().numpy()
             batch_size = pred_seg.shape[0]
             for i in range(batch_size):
                 # 获取 GT 的语义与实例分割，转换为 numpy 数组（保证为 int32 类型）
                 gt_semseg = data['semseg'][i].cpu().numpy().astype(np.int32)
                 gt_instance = data['instance'][i].cpu().numpy().astype(np.int32)
                 # 更新评价器（内部会先合并 semseg 与 instance，再计算匹配 IoU）
-                evaluator.add_sample(pred_seg[i], gt_semseg, gt_instance)
+                evaluator.add_image(pred_seg[i],pred_ins[i], gt_semseg, gt_instance)
 
         results = evaluator.evaluate()
         print("KITTI 全景评价结果：", results)
@@ -793,7 +793,7 @@ class TrainerAE(DatasetBase):
         size = predictions.shape[1]
         size_2 = predictions.shape[2]
         offset = int(0.02 * size)
-        max_size = 10
+        max_size = 6
         bs = min(predictions.shape[0], max_size)
         pred_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
         gt_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
@@ -823,6 +823,7 @@ class TrainerAE(DatasetBase):
             ptr += size_2 + offset
             if j == max_size - 1:
                 break
+            
         if stack_images:
             self.write_images(np.vstack([rgb_array, gt_array, pred_array, mask_array, panpotic_array]), 'rgb_gt_pred_ae_train.jpg')
         else:
@@ -859,10 +860,12 @@ class TrainerAE(DatasetBase):
 
             output.sample = F.interpolate(output.sample, size=targets.shape[-2:], mode='bilinear', align_corners=True)
             
-            preds = torch.argmax(output.sample, dim=1)
+            preds = torch.argmax(output.sample[:,0:30,:,:], dim=1)
+
+            preds_instance=torch.argmax(output.sample[:,30:60,:,:], dim=1)
 
             if threshold_output:
-                probs = F.softmax(output.sample, dim=1)
+                probs = F.softmax(output.sample[:,0:30,:,:], dim=1)
                 probs = probs.max(dim=1)[0]
                 preds[probs < self.mask_th] = self.ds.ignore_label
                 
@@ -871,8 +874,10 @@ class TrainerAE(DatasetBase):
 
             # save images
             if save_images and batch_idx == 0 and is_main_process():
-                predictions = preds.cpu().numpy()
-                predictions = self.encode_seg(predictions).astype(np.uint8)
+                predictions = preds.cpu().numpy().astype(np.uint8)
+                predictions_instance=preds_instance.cpu().numpy().astype(np.uint8)
+
+                predictions = self.encode_seg(predictions*50+predictions_instance).astype(np.uint8)
                 
                 targets = targets.cpu().numpy()
                 targets = self.encode_seg(targets).astype(np.uint8)
@@ -884,7 +889,7 @@ class TrainerAE(DatasetBase):
                 size_2 = predictions.shape[2]
                 
                 offset = int(0.02 * size)
-                max_size = 10
+                max_size = 6
                 bs = min(predictions.shape[0], max_size)
                 pred_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)
                 gt_array = np.zeros((size, bs * (size_2 + offset), 3), dtype=np.uint8)

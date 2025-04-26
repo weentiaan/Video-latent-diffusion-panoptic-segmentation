@@ -14,6 +14,6 @@ defaults:
 hydra:  
   output_subdir: null
 base: base
-datasets: kitti
+
 env: root_paths
 distributed: local

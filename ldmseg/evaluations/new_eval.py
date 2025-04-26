@@ -1,134 +1,196 @@
 import numpy as np
-import torch
-import torch.nn.functional as F
-from tqdm import tqdm
+from PIL import Image
+import six
+import os
+import multiprocessing as mp
+import pdb
+import sys
+import time
+import argparse
 
-class PanopticEvaluatorKITTI:
-    def __init__(self, iou_thresh=0.5, thing_ids=None, ignore_label=0):
-        """
-        针对 KITTI 数据集的全景评价器
 
-        参数:
-            iou_thresh: IoU 阈值，通常设为 0.5
-            thing_ids: 属于实例（thing）类别的语义标签集合，例如 {10,11,12,13,14,15,16,17}
-            ignore_label: 被忽略的标签（例如 0）
-        """
-        if thing_ids is None:
-            thing_ids = {10, 11, 12, 13, 14, 15, 16, 17}
-        self.iou_thresh = iou_thresh
-        self.thing_ids = thing_ids
-        self.ignore_label = ignore_label
-        # 用于区分类别内部不同实例的编码常数，一般取一个足够大的值
-        self.max_ins = 50  # 约 1e6
-        self.reset()
 
-    def reset(self):
-        self.TP = 0
-        self.FP = 0
-        self.FN = 0
-        self.iou_sum = 0.0
 
-    def _combine_panoptic(self, semseg, instance):
-        """
-        根据语义分割和实例分割生成全景 GT 图：
-          - 对于属于 thing 类别（在 self.thing_ids 中）的像素，
-            编码方式为： semseg * max_ins + instance
-          - 对于 stuff 类别，直接使用语义标签；
-          - 对于 ignore 标签（如 0）统一设置为 -1，不参与评价。
-        参数:
-            semseg: (H, W) 的 numpy 数组，GT 语义分割
-            instance: (H, W) 的 numpy 数组，GT 实例分割
-        返回:
-            panoptic: (H, W) 的 numpy 数组，合成后的全景 GT 编码
-        """
-        semseg = semseg.astype(np.uint8)
-        instance = instance.astype(np.uint8)
-        # 对于 thing 类别按照编码规则合并；否则直接用 semseg 值
-        panoptic = np.where(np.isin(semseg, list(self.thing_ids)),
-                            semseg * self.max_ins + instance,
-                            semseg)
-        # ignore 部分统一设置为 -1
-        panoptic[semseg == self.ignore_label] = -1
-        return panoptic.astype(np.uint8)
+def vpq_eval(element):
+    pred_ids, gt_ids = element
+    max_ins = 2 ** 20
+    ign_id = 255
+    offset = 2 ** 30
+    num_cat = 20
 
-    def _compute_iou(self, mask1, mask2):
-        """
-        计算两个二值 mask 的交并比（IoU）
-        """
-        intersection = np.logical_and(mask1, mask2).sum()
-        union = np.logical_or(mask1, mask2).sum()
-        if union == 0:
-            return 0.0
-        return intersection / union
+    iou_per_class = np.zeros(num_cat, dtype=np.float64)
+    tp_per_class = np.zeros(num_cat, dtype=np.float64)
+    fn_per_class = np.zeros(num_cat, dtype=np.float64)
+    fp_per_class = np.zeros(num_cat, dtype=np.float64)
 
-    def evaluate_image(self, pred_panoptic, gt_semseg, gt_instance):
-        """
-        对单张图像进行评价：
-          - 先将 GT 的 semseg 与 instance 合成全景 GT 图
-          - 遍历 GT 中的每个区域（除去 ignore 区域），在预测结果中寻找相同类别（根据编码）IoU
-            最大且大于阈值的区域作为匹配（TP）；未匹配计 FN，而预测中多出的区域计 FP。
-        返回:
-          tp, fp, fn, iou_sum
-        """
-        gt_panoptic = self._combine_panoptic(gt_semseg, gt_instance)
-        # 提取所有区域，不包括 ignore（即 -1）
-        gt_ids = np.unique(gt_panoptic)
-        pred_ids = np.unique(pred_panoptic)
-        gt_ids = gt_ids[gt_ids != -1]
-        pred_ids = pred_ids[pred_ids != -1]
+    def _ids_to_counts(id_array):
+        ids, counts = np.unique(id_array, return_counts=True)
+        return dict(six.moves.zip(ids, counts))
 
-        # 构造区域对应的二值 mask
-        gt_masks = {gid: (gt_panoptic == gid) for gid in gt_ids}
-        pred_masks = {pid: (pred_panoptic == pid) for pid in pred_ids}
+    pred_areas = _ids_to_counts(pred_ids)
+    gt_areas = _ids_to_counts(gt_ids)
 
-        matched_preds = set()
-        tp = 0
-        iou_sum = 0.0
-        # 对于每个 GT 区域，寻找最佳匹配的预测区域（类别必须一致）
-        for gt_id, gt_mask in gt_masks.items():
-            # 如果 gt_id 是 thing 类别，则类别为 gt_id // max_ins，否则为 gt_id 自身
-            gt_cat = (gt_id // self.max_ins) if gt_id >= self.max_ins else gt_id
-            best_iou = 0.0
-            best_pred = None
-            for pred_id, pred_mask in pred_masks.items():
-                pred_cat = (pred_id // self.max_ins) if pred_id >= self.max_ins else pred_id
-                if pred_cat != gt_cat:
-                    continue
-                iou = self._compute_iou(gt_mask, pred_mask)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_pred = pred_id
-            if best_iou >= self.iou_thresh and best_pred is not None:
-                tp += 1
-                iou_sum += best_iou
-                matched_preds.add(best_pred)
-        fp = len(pred_masks) - len(matched_preds)
-        fn = len(gt_masks) - tp
-        return tp, fp, fn, iou_sum
+    void_id = ign_id * max_ins
+    ign_ids = {
+        gt_id for gt_id in six.iterkeys(gt_areas)
+        if (gt_id // max_ins) == ign_id
+    }
 
-    def add_image(self, pred_panoptic, gt_semseg, gt_instance):
-        """
-        对单张图像，累积评价指标
-        """
-        tp, fp, fn, iou_sum = self.evaluate_image(pred_panoptic, gt_semseg, gt_instance)
-        self.TP += tp
-        self.FP += fp
-        self.FN += fn
-        self.iou_sum += iou_sum
+    int_ids = gt_ids.astype(np.int64) * offset + pred_ids.astype(np.int64)
+    int_areas = _ids_to_counts(int_ids)
 
-    def evaluate(self):
-        """
-        根据累计的 TP、FP、FN、iou_sum 计算评价指标：
-            SQ = iou_sum / TP
-            RQ = TP / (TP + 0.5 * (FP + FN))
-            PQ = SQ * RQ
-        """
-        epsilon = 1e-10
-        if self.TP == 0:
-            sq = 0.0
-            rq = 0.0
-        else:
-            sq = self.iou_sum / (self.TP + epsilon)
-            rq = self.TP / (self.TP + 0.5 * (self.FP + self.FN) + epsilon)
-        pq = sq * rq
-        return {"pq": pq, "sq": sq, "rq": rq, "iou_sum": self.iou_sum, "tp": self.TP, "fp": self.FP, "fn": self.FN}
+    def prediction_void_overlap(pred_id):
+        void_int_id = void_id * offset + pred_id
+        return int_areas.get(void_int_id, 0)
+
+    def prediction_ignored_overlap(pred_id):
+        total_ignored_overlap = 0
+        for _ign_id in ign_ids:
+            int_id = _ign_id * offset + pred_id
+            total_ignored_overlap += int_areas.get(int_id, 0)
+        return total_ignored_overlap
+
+    gt_matched = set()
+    pred_matched = set()
+
+    for int_id, int_area in six.iteritems(int_areas):
+        gt_id = int(int_id // offset)
+        gt_cat = int(gt_id // max_ins)
+        pred_id = int(int_id % offset)
+        pred_cat = int(pred_id // max_ins)
+        if gt_cat != pred_cat:
+            continue
+        union = (
+            gt_areas[gt_id] + pred_areas[pred_id] - int_area -
+            prediction_void_overlap(pred_id)
+        )
+        iou = int_area / union
+        if iou > 0.5:
+            tp_per_class[gt_cat] += 1
+            iou_per_class[gt_cat] += iou
+            gt_matched.add(gt_id)
+            pred_matched.add(pred_id)
+
+    for gt_id in six.iterkeys(gt_areas):
+        if gt_id in gt_matched:
+            continue
+        cat_id = gt_id // max_ins
+        if cat_id == ign_id:
+            continue
+        fn_per_class[cat_id] += 1
+
+    for pred_id in six.iterkeys(pred_areas):
+        if pred_id in pred_matched:
+            continue
+        if (prediction_ignored_overlap(pred_id) / pred_areas[pred_id]) > 0.5:
+            continue
+        cat = pred_id // max_ins
+        fp_per_class[cat] += 1
+
+    return (iou_per_class, tp_per_class, fn_per_class, fp_per_class)
+
+
+def eval(element):
+    max_ins = 2 ** 20
+
+    result, gt_cat,gt_ins, depth_preds, depth_gts = element
+    
+    pred = np.array(result)
+    
+    gts_cat = [np.array(i) for i in gt_cat]
+    gts_ins = [
+        np.array(i) for i in gt_ins]
+    gts = [gt_cat.astype(np.int32) * max_ins + gt_ins.astype(np.int32)
+           for gt_cat, gt_ins in zip(gts_cat, gts_ins)]
+    depth_thres=0.5
+    abs_rel = 0
+    if depth_thres > 0:
+        depth_preds = np.array([np.array(i) for i in depth_preds])
+        depth_gts = np.array([np.array(i) for i in depth_gts])
+        
+        depth_mask = depth_gts > 0
+        abs_rel = np.mean(
+            np.abs(
+                depth_preds[depth_mask] -
+                depth_gts[depth_mask]) /
+            depth_gts[depth_mask])
+        pred_in_mask = pred[:, :]
+        
+        pred_in_depth_mask = pred_in_mask[depth_mask]
+        ignored_pred_mask = (
+            np.abs(
+                depth_preds[depth_mask] -
+                depth_gts[depth_mask]) /
+            depth_gts[depth_mask]) > depth_thres
+        pred_in_depth_mask[ignored_pred_mask] = 19 * max_ins
+        pred_in_mask[depth_mask] = pred_in_depth_mask
+        pred[:,:] = pred_in_mask
+
+    gt = gts
+    result = vpq_eval(np.array([pred, gt]))
+
+    return result + (abs_rel, )
+
+
+def main():
+    gt_names = os.scandir(gt_dir)
+    gt_names = [name.name for name in gt_names if 'gtFine_class' in name.name]
+    gt_names = [os.path.join(gt_dir, name) for name in gt_names]
+    gt_names = sorted(gt_names)
+
+    depth_gt_names = os.scandir(gt_dir)
+    depth_gt_names = [
+        name.name for name in depth_gt_names if 'depth' in name.name]
+    depth_gt_names = [os.path.join(gt_dir, name) for name in depth_gt_names]
+    depth_gt_names = sorted(depth_gt_names)
+
+    depth_pred_names = os.scandir(depth_dir)
+    depth_pred_names = [name.name for name in depth_pred_names]
+    depth_pred_names = [os.path.join(depth_dir, name)
+                        for name in depth_pred_names]
+    depth_pred_names = sorted(depth_pred_names)
+
+    pred_names = os.scandir(pred_dir)
+    pred_names = [os.path.join(pred_dir, name.name) for name in pred_names]
+    cat_pred_names = [name for name in pred_names if name.endswith('cat.png')]
+    ins_pred_names = [name for name in pred_names if name.endswith('ins.png')]
+    cat_pred_names = sorted(cat_pred_names)
+    ins_pred_names = sorted(ins_pred_names)
+
+    all_lst = []
+    for i in range(len(cat_pred_names) - eval_frames + 1):
+        all_lst.append([cat_pred_names[i: i + eval_frames],
+                        ins_pred_names[i: i + eval_frames],
+                        gt_names[i: i + eval_frames],
+                        depth_pred_names[i: i + eval_frames],
+                        depth_gt_names[i: i + eval_frames]])
+
+    N = mp.cpu_count() // 2
+    with mp.Pool(processes=N) as p:
+        results = p.map(eval, all_lst)
+
+    iou_per_class = np.stack([result[0] for result in results]).sum(axis=0)
+    tp_per_class = np.stack([result[1] for result in results]).sum(axis=0)
+    fn_per_class = np.stack([result[2] for result in results]).sum(axis=0)
+    fp_per_class = np.stack([result[3] for result in results]).sum(axis=0)
+    abs_rel = np.stack([result[4] for result in results]).mean(axis=0)
+    epsilon = 1e-10
+    iou_per_class = iou_per_class[:19]
+    tp_per_class = tp_per_class[:19]
+    fn_per_class = fn_per_class[:19]
+    fp_per_class = fp_per_class[:19]
+    sq = iou_per_class / (tp_per_class + epsilon)
+    rq = tp_per_class / (tp_per_class + 0.5 *
+                         fn_per_class + 0.5 * fp_per_class + epsilon)
+    pq = sq * rq
+    spq = pq[8:]
+    tpq = pq[:8]
+    print(
+        r'{:.1f} {:.1f} {:.1f}'.format(
+            pq.mean() * 100,
+            tpq.mean() * 100,
+            spq.mean() * 100))
+
+
+if __name__ == '__main__':
+    main()
