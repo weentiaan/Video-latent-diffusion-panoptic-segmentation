@@ -80,7 +80,7 @@ train_kwargs:
    sample_posterior: False
    sample_posterior_rgb: False
    remap_seg: True
-   train_num_steps: 20000
+   train_num_steps: 40000
    batch_size: 32
    accumulate: 1
    num_workers: 8
@@ -127,7 +127,7 @@ eval_kwargs:
    overlap_th: 0.5
    batch_size: 16
    num_workers: 2
-   vis_every: 5000
+   vis_every: 2000
    print_freq: 100
 
 # Optimizer

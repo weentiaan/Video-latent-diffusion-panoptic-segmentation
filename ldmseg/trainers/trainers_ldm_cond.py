@@ -1613,8 +1613,8 @@ class TrainerDiffusion(DatasetBase):
             scheduler=scheduler,
         )
 
-        images = self.decode_latents(latents, rgb_latents=rgb_latents, weight_dtype=torch.float32)
-
+        images =self.decode_latents(latents, rgb_latents=rgb_latents, weight_dtype=torch.float32)
+        
         if self.use_wandb:
             timesteps = timesteps.cpu().numpy()
             if 'images' not in log_dict:
@@ -1654,11 +1654,12 @@ class TrainerDiffusion(DatasetBase):
             pred_images = self.decode_latents(pred_latents, rgb_latents=rgb_latents)
             noisy_images = self.decode_latents(noisy_latents, rgb_latents=rgb_latents)
             sanity_images = self.decode_latents(original_latents, rgb_latents=rgb_latents)
+
             rgb_images = (255 * rgb_images).cpu().numpy().transpose(0, 2, 3, 1)
             gt_images = self.encode_seg(gt_images.cpu().numpy()).astype(np.uint8)
             if inpainting_masks is not None:
                 inpainting_masks = F.interpolate(inpainting_masks.float()[:, None],
-                                                 size=(self.image_size, self.image_size_2),
+                                                 size=(self.image_size, self.size),
                                                  mode='nearest')
                 inpainting_masks = (255 * inpainting_masks.repeat(1, 3, 1, 1))
                 inpainting_masks = inpainting_masks.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
@@ -1666,18 +1667,49 @@ class TrainerDiffusion(DatasetBase):
             else:
                 inpainting_masks = np.zeros_like(gt_images)
                 add_inpainting = False
+            #print(pred_images.shape,rgb_images.shape,gt_images.shape,noisy_images.shape,sanity_images.shape,images.shape,inpainting_masks.shape)
+            pred_images = torch.from_numpy(pred_images).permute(0,3,1,2)
+            noisy_images = torch.from_numpy(noisy_images).permute(0,3,1,2)
+            sanity_images = torch.from_numpy(sanity_images).permute(0,3,1,2)
+            images = torch.from_numpy(images).permute(0,3,1,2)
 
+            pred_images = F.interpolate(
+                pred_images,
+                size=(192, 640),
+                mode="nearest",
+            ).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+
+            noisy_images = F.interpolate(
+                noisy_images,
+                size=(192, 640),
+                mode="bilinear",
+                align_corners=False,
+            ).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+
+            sanity_images = F.interpolate(
+                sanity_images,
+                size=(192, 640),
+                mode="bilinear",
+                align_corners=False,
+            ).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+
+            images = F.interpolate(
+                images,
+                size=(192, 640),
+                mode="nearest",
+            ).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+            #print(pred_images.shape,rgb_images.shape,gt_images.shape,noisy_images.shape,sanity_images.shape,images.shape,inpainting_masks.shape)
             ptr = 0
             size = self.image_size
-            size2=self.image_size_2
+            size_2 = self.image_size_2
             offset = int(0.02 * size)
-            pred_array = np.zeros((size, nimgs * (size2 + offset), 3), dtype=np.uint8)
-            rgb_array = np.zeros((size, nimgs * (size2 + offset), 3), dtype=np.uint8)
-            gt_array = np.zeros((size, nimgs * (size2 + offset), 3), dtype=np.uint8)
-            noisy_array = np.zeros((size, nimgs * (size2 + offset), 3), dtype=np.uint8)
-            sanity_array = np.zeros((size, nimgs * (size2 + offset), 3), dtype=np.uint8)
-            gen_array = np.zeros((size, nimgs * (size2 + offset), 3), dtype=np.uint8)
-            inpaint_array = np.zeros((size, nimgs * (size2 + offset), 3), dtype=np.uint8)
+            pred_array = np.zeros((size, nimgs * (size_2 + offset), 3), dtype=np.uint8)
+            rgb_array = np.zeros((size, nimgs * (size_2 + offset), 3), dtype=np.uint8)
+            gt_array = np.zeros((size, nimgs * (size_2 + offset), 3), dtype=np.uint8)
+            noisy_array = np.zeros((size, nimgs * (size_2 + offset), 3), dtype=np.uint8)
+            sanity_array = np.zeros((size, nimgs * (size_2 + offset), 3), dtype=np.uint8)
+            gen_array = np.zeros((size, nimgs * (size_2 + offset), 3), dtype=np.uint8)
+            inpaint_array = np.zeros((size, nimgs * (size_2 + offset), 3), dtype=np.uint8)
             for idx, (image, rgb, gt, noisy_image, sanity_image, gen_image, inpaint_image) in enumerate(zip(
                 pred_images[:nimgs],
                 rgb_images[:nimgs],
@@ -1688,19 +1720,23 @@ class TrainerDiffusion(DatasetBase):
                 inpainting_masks[:nimgs],
             )):
 
-                pred_array[:, ptr:ptr + size2, :] = image
-                rgb_array[:, ptr:ptr + size2, :] = rgb
-                gt_array[:, ptr:ptr + size2, :] = gt
-                noisy_array[:, ptr:ptr + size2, :] = noisy_image
-                sanity_array[:, ptr:ptr + size2, :] = sanity_image
-                gen_array[:, ptr:ptr + size2, :] = gen_image
-                inpaint_array[:, ptr:ptr + size2, :] = inpaint_image
-                ptr += size2 + offset
-
+                pred_array[:, ptr:ptr + size_2, :] = image
+                rgb_array[:, ptr:ptr + size_2, :] = rgb
+                gt_array[:, ptr:ptr + size_2, :] = gt
+                noisy_array[:, ptr:ptr + size_2, :] = noisy_image
+                sanity_array[:, ptr:ptr + size_2, :] = sanity_image
+                gen_array[:, ptr:ptr + size_2, :] = gen_image
+                inpaint_array[:, ptr:ptr + size_2, :] = inpaint_image
+                ptr += size_2 + offset
+                
             stacked_images = [rgb_array, gt_array, sanity_array, noisy_array, pred_array, gen_array]
             if add_inpainting:
                 stacked_images.append(inpaint_array)
-            self.write_images(np.vstack(stacked_images), 'all.png')
+            import datetime
+ 
+
+            time1 = datetime.datetime.now()
+            self.write_images(np.vstack(stacked_images), str(time1)+'all.png')
 
             print(f'saved predictions during train with timesteps {timesteps.cpu().tolist()}')
 

@@ -177,14 +177,12 @@ class KITTI(data.Dataset):
                 continue
 
             # if self.split=="train":
-            #     if frame>="000100":
+            #     if frame>="000010":
             #         continue
             # else:
-            #     if frame>="00100":
+            #     if frame>="000010":
             #         continue
-            # if self.split=="val":
-            #     if frame>="000100":
-            #         continue
+            
             if scene not in sample_dict:
                 sample_dict[scene] = {}
             if frame not in sample_dict[scene]:
