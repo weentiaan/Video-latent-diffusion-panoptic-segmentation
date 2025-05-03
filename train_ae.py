@@ -86,7 +86,7 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------------
     # Step 6: 启动训练
-    cfg_dataset['train_kwargs']['train_num_steps']=20000
+    cfg_dataset['train_kwargs']['train_num_steps']=12000
     cfg_dataset['lr_scheduler_kwargs']['warmup_iters']=200
     if cfg.get('debug', True):
         # Debug 模式下直接调用 main_worker（单 GPU 单进程）

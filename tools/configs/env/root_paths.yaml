@@ -1,2 +1,2 @@
 root_dir: '/root/autodl-tmp/Video-latent-diffusion-panoptic-segmentation'
-data_dir: '/root/autodl-tmp/video_sequence'
+data_dir: '/root/autodl-tmp/cityscapes-dvps/video_sequence'

@@ -118,7 +118,6 @@ class SegmentationLosses(nn.Module):
         self,
         outputs: torch.Tensor,
         targets: Dict,
-        instance: Dict,
         indices=None,
     ) -> torch.tensor:
         """
@@ -128,7 +127,7 @@ class SegmentationLosses(nn.Module):
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
         # we first need to convert the targets to the format expected by the loss
         if indices is None:
-            targets, indices = self.prepare_targets(targets,instance, ignore_label=self.ignore_label)
+            targets, indices = self.prepare_targets(targets,ignore_label=self.ignore_label)
 
         # filter empty masks
         masks = [t["masks"] for t in targets]
@@ -346,7 +345,7 @@ class SegmentationLosses(nn.Module):
                 mode='nearest',
                 align_corners=False,
             ).squeeze(1).to(torch.long)
-
+            
         point_logits = point_sample(
             outputs,
             point_coords,
@@ -366,7 +365,7 @@ class SegmentationLosses(nn.Module):
         self,
         outputs: torch.Tensor,
         targets: torch.Tensor,
-        instance: torch.Tensor,
+        
         do_matching: bool = False,
         masks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -387,10 +386,10 @@ class SegmentationLosses(nn.Module):
             indices = self.matcher(outputs, targets)
         
         # (1) ce loss on uncertain regions
-        ce_loss = self.loss_ce(outputs[:,0:30,:,:], targets, indices=indices, masks=masks)
+        ce_loss = self.loss_ce(outputs, targets, indices=indices, masks=masks)
         
         # (2) bce + dice loss for uncertain regions per object mask
-        mask_loss = self.loss_masks(outputs[:,30:60,:,:], targets,instance, indices=indices)
+        mask_loss = self.loss_masks(outputs, targets, indices=indices)
         losses = {'ce': ce_loss, 'mask': mask_loss}
 
         return losses
@@ -399,7 +398,6 @@ class SegmentationLosses(nn.Module):
     def prepare_targets(
         self,
         targets,
-        instance,
         ignore_label=0,
     ):
 
@@ -412,8 +410,10 @@ class SegmentationLosses(nn.Module):
         """
         new_targets = []
         instance_ids = []
+        targets=targets
         
-        for idx_t, target in enumerate(instance):
+        for idx_t, target in enumerate(targets):
+            target=target
             unique_classes = torch.unique(target)
             masks = []
 

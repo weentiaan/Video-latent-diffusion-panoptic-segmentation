@@ -38,6 +38,8 @@ from ldmseg.utils import (
 )
 
 from ldmseg.evaluations import KITTIPanopticEvaluator
+from ldmseg.evaluations.cityscapes_pap_eval import compute_cityscapes_pq
+from ldmseg.evaluations import PanopticEvaluatorAgnostic
  
 def get_color_map(num_colors):
     """
@@ -234,12 +236,12 @@ class TrainerAE(DatasetBase):
         self.loss_weights = self.p['loss_weights']
         self.evaluate_trainset = False
 
-    def compute_point_loss(self, outputs, targets,instance, do_matching=False, masks=None):
+    def compute_point_loss(self, outputs, targets, do_matching=False, masks=None):
         posterior = outputs.posterior#概率分布
         outputs = outputs.sample#预测值
 
         # (1) compute segmentation losses (ce + mask)
-        losses = self.segmentation_losses.point_loss(outputs, targets,instance, do_matching, masks)
+        losses = self.segmentation_losses.point_loss(outputs, targets, do_matching, masks)
 
         # (2) compute kl loss
         losses['kl'] = torch.mean(posterior.kl())
@@ -277,7 +279,7 @@ class TrainerAE(DatasetBase):
     def train_single_epoch(self, epoch, meters_dict, progress, semseg_meter):
         """ Train the model for one epoch
         """ 
-            
+        self.vae_model.train()
         total_loss = total_ce_loss = total_kl_loss = total_mask_loss = 0.
         for batch_idx, data in enumerate(self.dl):
 
@@ -288,9 +290,8 @@ class TrainerAE(DatasetBase):
             # images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)#[bit,h,w]
             # targets = data['semseg'].cuda(self.args['gpu'], non_blocking=True)#[3,h,w]
             # images = 2. * images - 1.
-            images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)#[bit,h,w]
-            targets = data['semseg'].cuda(self.args['gpu'], non_blocking=True)#[3,h,w]
-            instance = data['instance'].cuda(self.args['gpu'], non_blocking=True)
+            images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)  # [bit,h,w]
+            targets = data['semseg'].cuda(self.args['gpu'], non_blocking=True)  # [3,h,w]
             images = 2. * images - 1.
             
             # move rgb to gpu if needed
@@ -322,7 +323,7 @@ class TrainerAE(DatasetBase):
             # update loss
             with torch.autocast('cuda', enabled=self.fp16_scaler is not None):
                 output = self.vae_model(images, sample_posterior=True, rgb_sample=rgbs, valid_mask=latent_mask)
-                loss, ce_loss, kl_loss, mask_loss = self.compute_point_loss(output, targets,instance, masks=masks)
+                loss, ce_loss, kl_loss, mask_loss = self.compute_point_loss(output, targets, masks=masks)
                 loss = loss / self.gradient_accumulate_every
                 total_loss += loss.detach()
                 total_ce_loss += (ce_loss / self.gradient_accumulate_every).detach()
@@ -604,7 +605,7 @@ class TrainerAE(DatasetBase):
             if name.lower() == 'miou':
                 self.compute_miou(threshold_output=threshold_output, save_images=save_images)
             elif name.lower() == 'pq':
-                self.compute_pq_kitti(threshold_output=threshold_output, save_images=save_images)
+                self.compute_cityscapes_pq(threshold_output=threshold_output, save_images=save_images)
             else:
                 raise NotImplementedError(f'Unknown metric {name}')
 
@@ -617,51 +618,7 @@ class TrainerAE(DatasetBase):
         x_min, x_max = padding_co[:, 1].min(), padding_co[:, 1].max()
         prediction = prediction[:, y_min:y_max + 1, x_min:x_max + 1]
         return prediction
-    @torch.no_grad()
-    def compute_pq_kitti(self, threshold_output=True, save_images=False):
-        """
-        针对 KITTI 数据集计算全景质量（PQ）
-          1. 将模型置于评估模式
-          2. 对验证集中的每个 batch：
-               - 对图像输入（image_semseg）归一化处理后，执行模型预测，
-                 并用 argmax 得到预测的单通道全景分割图（假设输出通道对应类别概率）。
-               - 对于 batch 中的每张图像，提取 GT 的语义分割（'semseg'）和实例分割（'instance'），
-                 转换为 numpy 数组（注意数据类型转换），
-                 调用 evaluator.add_image(pred, gt_semseg, gt_instance) 累积评价统计。
-          3. 遍历完所有 batch 后，通过 evaluator.evaluate() 输出 PQ、SQ、RQ 等指标。
-        """
-        self.vae_model.eval()
-        evaluator = KITTIPanopticEvaluator(
-            iou_thresh=0.5,
-            thing_ids={10, 11, 12, 13, 14, 15, 16, 17},
-            ignore_label=self.ds_val.ignore_label,
-            max_ins=30
-        )
-        
-        for batch_idx, data in tqdm(enumerate(self.dl_val)):
-            # 获取经过预处理的输入图像（例如 image_semseg 经过归一化）
-            images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)
-            # 假设输入已归一化为 [-1,1]，否则可按 2*x-1 处理
-            images = 2. * images - 1.
-            target_size = data['semseg'][0].shape
-            # 模型推理：得到预测 logits（形状 (B, C, H, W)）
-            output = self.vae_model(images, sample_posterior=False)
-            output = F.interpolate(output.sample, size=target_size, mode="bilinear", align_corners=False)
-            # 对输出使用 argmax 获得预测分割（形状 (B, H, W)）
-            pred_seg = torch.argmax(output[:,0:30,:,:], dim=1).cpu().numpy()
-            pred_ins = torch.argmax(output[:,30:60,:,:], dim=1).cpu().numpy()
-            batch_size = pred_seg.shape[0]
-            for i in range(batch_size):
-                # 获取 GT 的语义与实例分割，转换为 numpy 数组（保证为 int32 类型）
-                gt_semseg = data['semseg'][i].cpu().numpy().astype(np.int32)
-                gt_instance = data['instance'][i].cpu().numpy().astype(np.int32)
-                # 更新评价器（内部会先合并 semseg 与 instance，再计算匹配 IoU）
-                evaluator.add_image(pred_seg[i],pred_ins[i], gt_semseg, gt_instance)
-
-        results = evaluator.evaluate()
-        print("KITTI 全景评价结果：", results)
-        self.vae_model.train()
-        return results
+    
 
     @torch.no_grad()
     def compute_pq(
@@ -766,6 +723,162 @@ class TrainerAE(DatasetBase):
         self.vae_model.train()
         return
     
+    @torch.no_grad()
+    def compute_cityscapes_pq(self, threshold_output=True, save_images=False):
+        """
+        计算 Cityscapes 数据集的全景分割质量（PQ）
+        
+        此方法与 compute_pq_kitti 类似，但专门针对 Cityscapes 数据格式：
+        1. 将模型置于评估模式
+        2. 迭代验证集中的每个 batch：
+           - 获取模型预测并进行后处理
+           - 对于每个图像，提取预测的全景分割图和真实语义分割标签
+           - 使用 compute_cityscapes_pq 函数评估质量
+        3. 汇总并输出评估结果
+        """
+        from ldmseg.evaluations.cityscapes_pap_eval import compute_cityscapes_pq
+        
+        self.vae_model.eval()
+        all_results = []
+        
+        for batch_idx, data in tqdm(enumerate(self.dl_val)):
+            # 获取输入图像
+            images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)
+            images = 2. * images - 1.
+            
+            # 获取RGB图像（如果需要）
+            rgbs = None
+            if self.fuse_rgb:
+                rgbs = data['image'].cuda(self.args['gpu'], non_blocking=True)
+                rgbs = 2. * rgbs - 1.
+            
+            # 进行模型推理
+            output = self.vae_model(images, sample_posterior=False, rgb_sample=rgbs)
+            
+            # 对输出进行上采样到原始大小
+            target_size = data['semseg'][0].shape
+            output = F.interpolate(output.sample, size=target_size, mode="bilinear", align_corners=False)
+            
+            # 使用argmax获取预测的单通道全景分割图
+            pred_panoptic = torch.argmax(output, dim=1)
+            
+            # 阈值处理（如果需要）
+            if threshold_output:
+                probs = F.softmax(output, dim=1)
+                max_probs = probs.max(dim=1)[0]
+                pred_panoptic[max_probs < self.mask_th] = 0
+            
+            # 评估每个样本
+            batch_size = pred_panoptic.shape[0]
+            for i in range(batch_size):
+                # 获取当前样本的预测和真实标签
+                pred = pred_panoptic[i].cpu().numpy()
+                gt_semantic = data['semseg'][i].cpu().numpy().astype(np.int32)
+                
+                # 计算评估指标
+                result = compute_cityscapes_pq(
+                    panoptic_pred=pred,
+                    gt_semantic=gt_semantic,
+                    count_th=self.count_th,
+                    mask_th=self.mask_th,
+                    overlap_th=self.overlap_th
+                )
+                all_results.append(result)
+            
+            # 可选：保存第一个batch的可视化结果
+            if save_images and batch_idx == 0 and is_main_process():
+                self.save_panoptic_visualization(pred_panoptic, data, identifier='cityscapes')
+        
+        # 汇总评估结果
+        if all_results:
+            avg_pq = np.mean([r['pq'] for r in all_results])
+            avg_sq = np.mean([r['sq'] for r in all_results])
+            avg_rq = np.mean([r['rq'] for r in all_results])
+            
+            # 输出结果
+            print(f"Cityscapes Panoptic Evaluation Results:")
+            print(f"PQ: {avg_pq:.4f}, SQ: {avg_sq:.4f}, RQ: {avg_rq:.4f}")
+            
+            if len(all_results) > 0 and 'per_class' in all_results[0]:
+                # 计算每个类别的平均PQ
+                class_ids = set()
+                for r in all_results:
+                    class_ids.update(r['per_class'].keys())
+                
+                class_metrics = {}
+                for class_id in class_ids:
+                    class_pq = np.mean([r['per_class'].get(class_id, {'pq': 0})['pq'] for r in all_results if class_id in r['per_class']])
+                    class_metrics[class_id] = class_pq
+                
+                # 打印类别级别的结果
+                print("\n类别级别的PQ:")
+                for class_id, pq in sorted(class_metrics.items()):
+                    print(f"类别 {class_id}: PQ = {pq:.4f}")
+            
+            final_result = {
+                'pq': avg_pq,
+                'sq': avg_sq,
+                'rq': avg_rq,
+                'details': all_results
+            }
+            
+            if self.use_wandb and is_main_process():
+                wandb.log({
+                    "cityscapes_pq": avg_pq,
+                    "cityscapes_sq": avg_sq,
+                    "cityscapes_rq": avg_rq
+                })
+            
+            return final_result
+        
+        self.vae_model.train()
+        return None
+    
+    def save_panoptic_visualization(self, pred_panoptic, data, identifier=''):
+        """保存全景分割可视化结果"""
+        if not is_main_process():
+            return
+            
+        # 将预测结果转换为彩色图像
+        predictions = pred_panoptic.cpu().numpy()
+        colormap = get_color_map(256)  # 使用之前定义的颜色映射函数
+        
+        # 获取GT和RGB图像
+        targets = data['semseg'].numpy()
+        rgbs = (data['image'].numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+        
+        # 设置可视化参数
+        size = predictions.shape[2]  # 宽度
+        height = predictions.shape[1]  # 高度
+        offset = int(0.02 * size)
+        max_size = 6
+        bs = min(predictions.shape[0], max_size)
+        
+        # 创建画布
+        pred_array = np.zeros((height, bs * (size + offset), 3), dtype=np.uint8)
+        gt_array = np.zeros((height, bs * (size + offset), 3), dtype=np.uint8)
+        rgb_array = np.zeros((height, bs * (size + offset), 3), dtype=np.uint8)
+        
+        ptr = 0
+        for j, (pred, target, rgb) in enumerate(zip(predictions, targets, rgbs)):
+            # 为预测的全景分割添加颜色
+            colored_pred = colorize_panoptic(pred, colormap)
+            # 为GT添加颜色
+            colored_gt = self.encode_seg(target[None, ...])[0]
+            
+            # 填充画布
+            pred_array[:, ptr:ptr+size, :] = colored_pred
+            gt_array[:, ptr:ptr+size, :] = colored_gt
+            rgb_array[:, ptr:ptr+size, :] = rgb
+            ptr += size + offset
+            if j == max_size - 1:
+                break
+                
+        # 保存结果
+        stacked_image = np.vstack([rgb_array, gt_array, pred_array])
+        filename = f'panoptic_vis_{identifier}.jpg'
+        self.write_images(stacked_image, filename)
+        print(f'save {filename}')
 
     @torch.no_grad()
     def save_train_images(self, output: dict, data: dict, threshold_output: bool = False, stack_images: bool = False):
@@ -804,9 +917,9 @@ class TrainerAE(DatasetBase):
         colormap = get_color_map(20)
         max_pool = nn.MaxPool2d(kernel_size=2, stride=1,padding=1)
         for j, (semseg, target, rgb, mask,pap_gt) in enumerate(zip(predictions, targets, rgbs, masks,pap_gts)):
-            seg = self.ds.decode_bitmap(data['image_semseg'][j,0:5,:,:],n = 5).cpu().numpy().astype(np.uint8)  # [3, H, W], 已经是 0～1 之间
-            instance = self.ds.decode_bitmap(data['image_semseg'][j,5:10,:,:],n = 5).cpu().numpy().astype(np.uint8) # [3, H, W], 已经是 0～1 之间
-            pop=(seg*100+instance)
+            seg = self.ds.decode_bitmap(data['image_semseg'][j,:,:,:],n = 16).cpu().numpy().astype(np.uint8)  # [3, H, W], 已经是 0～1 之间
+            
+            pop=seg
             color_image = colorize_panoptic(pop, colormap)
             img_tensor = torch.tensor(color_image, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
             pooled_tensor = max_pool(max_pool(max_pool(img_tensor)))
@@ -860,12 +973,12 @@ class TrainerAE(DatasetBase):
 
             output.sample = F.interpolate(output.sample, size=targets.shape[-2:], mode='bilinear', align_corners=True)
             
-            preds = torch.argmax(output.sample[:,0:30,:,:], dim=1)
+            preds = torch.argmax(output.sample, dim=1)
 
-            preds_instance=torch.argmax(output.sample[:,30:60,:,:], dim=1)
+            
 
             if threshold_output:
-                probs = F.softmax(output.sample[:,0:30,:,:], dim=1)
+                probs = F.softmax(output.sample, dim=1)
                 probs = probs.max(dim=1)[0]
                 preds[probs < self.mask_th] = self.ds.ignore_label
                 
@@ -875,9 +988,9 @@ class TrainerAE(DatasetBase):
             # save images
             if save_images and batch_idx == 0 and is_main_process():
                 predictions = preds.cpu().numpy().astype(np.uint8)
-                predictions_instance=preds_instance.cpu().numpy().astype(np.uint8)
+                
 
-                predictions = self.encode_seg(predictions*50+predictions_instance).astype(np.uint8)
+                predictions = self.encode_seg(predictions).astype(np.uint8)
                 
                 targets = targets.cpu().numpy()
                 targets = self.encode_seg(targets).astype(np.uint8)
@@ -901,9 +1014,9 @@ class TrainerAE(DatasetBase):
                 colormap = get_color_map(20)
                 max_pool = nn.MaxPool2d(kernel_size=2, stride=1,padding=1)
                 for j, (semseg, target, rgb, mask) in enumerate(zip(predictions, targets, rgbs, masks)):
-                    seg = self.ds.decode_bitmap(data['image_semseg'][j,0:5,:,:],n = 5).cpu().numpy().astype(np.uint8)  # [3, H, W], 已经是 0～1 之间
-                    instance = self.ds.decode_bitmap(data['image_semseg'][j,5:10,:,:],n = 5).cpu().numpy().astype(np.uint8) # [3, H, W], 已经是 0～1 之间
-                    pop=(seg*100+instance)
+                    seg = self.ds.decode_bitmap(data['image_semseg'][j,:,:,:],n = 16).cpu().numpy().astype(np.uint8)  # [3, H, W], 已经是 0～1 之间
+                    
+                    pop=seg
                     color_image = colorize_panoptic(pop, colormap)
                     img_tensor = torch.tensor(color_image, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
                     pooled_tensor = max_pool(max_pool(max_pool(img_tensor)))
@@ -986,3 +1099,62 @@ class TrainerAE(DatasetBase):
         key = f'panoptic_overlay{identifier}.jpg'
         self.write_images(panoptic_overlay_array, key)
         return
+
+    @torch.no_grad()
+    def compute_pq_kitti(self, threshold_output=True, save_images=False):
+        """
+        针对 KITTI 数据集计算全景质量（PQ）
+          1. 将模型置于评估模式
+          2. 对验证集中的每个 batch：
+               - 对图像输入（image_semseg）归一化处理后，执行模型预测，
+                 并用 argmax 得到预测的单通道全景分割图（假设输出通道对应类别概率）。
+               - 对于 batch 中的每张图像，提取 GT 的语义分割（'semseg'）和实例分割（'instance'），
+                 转换为 numpy 数组（注意数据类型转换），
+                 调用 evaluator.add_image(pred, gt_semseg, gt_instance) 累积评价统计。
+          3. 遍历完所有 batch 后，通过 evaluator.evaluate() 输出 PQ、SQ、RQ 等指标。
+        """
+        self.vae_model.eval()
+        evaluator = KITTIPanopticEvaluator(
+            iou_thresh=0.5,
+            thing_ids={10, 11, 12, 13, 14, 15, 16, 17},
+            ignore_label=self.ds_val.ignore_label,
+            max_ins=30
+        )
+        
+        for batch_idx, data in tqdm(enumerate(self.dl_val)):
+            # 获取经过预处理的输入图像（例如 image_semseg 经过归一化）
+            images = data['image_semseg'].cuda(self.args['gpu'], non_blocking=True)
+            # 假设输入已归一化为 [-1,1]，否则可按 2*x-1 处理
+            images = 2. * images - 1.
+            target_size = data['semseg'][0].shape
+            
+            # 添加RGB支持
+            rgbs = None
+            if self.fuse_rgb:
+                rgbs = data['image'].cuda(self.args['gpu'], non_blocking=True)
+                rgbs = 2. * rgbs - 1.
+            
+            # 模型推理：得到预测 logits（形状 (B, C, H, W)）
+            output = self.vae_model(images, sample_posterior=False, rgb_sample=rgbs)
+            output = F.interpolate(output.sample, size=target_size, mode="bilinear", align_corners=False)
+            
+            # 对输出使用 argmax 获得预测分割（形状 (B, H, W)）
+            pred_seg = torch.argmax(output, dim=1).cpu().numpy()
+            
+            batch_size = pred_seg.shape[0]
+            for i in range(batch_size):
+                # 获取 GT 的语义与实例分割，转换为 numpy 数组（保证为 int32 类型）
+                gt_semseg = data['semseg'][i].cpu().numpy().astype(np.int32)
+               
+                
+                # 生成预测的实例分割图（这里简化处理，直接用语义预测作为实例ID）
+                # 在实际应用中，您可能需要根据您的数据和任务来调整此部分
+                pred_instance = np.zeros_like(pred_seg[i])
+                
+                # 更新评价器（内部会先合并 semseg 与 instance，再计算匹配 IoU）
+                evaluator.add_image(pred_seg[i], pred_instance, gt_semseg, gt_instance)
+
+        results = evaluator.evaluate()
+        print("KITTI 全景评价结果：", results)
+        self.vae_model.train()
+        return results

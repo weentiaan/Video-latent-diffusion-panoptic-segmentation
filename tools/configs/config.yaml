@@ -7,7 +7,7 @@ debug: False
 defaults:
     - _self_
     - base: base
-    - datasets: kitti
+    - datasets: cityscapes
     - env: root_paths
     - distributed: local
 
