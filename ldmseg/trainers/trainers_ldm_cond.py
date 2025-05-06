@@ -1389,7 +1389,7 @@ class TrainerDiffusion(DatasetBase):
         """ Write example predictions to disk
         """
 
-        images = torch.from_numpy(self.decode_latents(latents, rgb_latents=rgb_latents, weight_dtype=torch.float32).transpose(0, 3, 2, 1))
+        images = torch.from_numpy(self.decode_latents(latents, rgb_latents=rgb_latents, weight_dtype=torch.float32).transpose(0, 3, 1, 2))
         images = F.interpolate(images,size=(self.image_size, self.image_size_2),mode='nearest')
         images = images.cpu().numpy().transpose(0, 2, 3, 1)
 
@@ -1474,7 +1474,7 @@ class TrainerDiffusion(DatasetBase):
             scheduler=scheduler,
         )
 
-        images = torch.from_numpy(self.decode_latents(latents, rgb_latents=rgb_latents, weight_dtype=torch.float32).transpose(0, 3, 2, 1))
+        images = torch.from_numpy(self.decode_latents(latents, rgb_latents=rgb_latents, weight_dtype=torch.float32).transpose(0, 3, 1, 2))
         images = F.interpolate(images,size=(self.image_size, self.image_size_2),mode='nearest')
         images = images.cpu().numpy().transpose(0, 2, 3, 1)
 
@@ -1514,15 +1514,15 @@ class TrainerDiffusion(DatasetBase):
         else:
 
             nimgs = self.batch_size_val
-            pred_images = torch.from_numpy(self.decode_latents(pred_latents, rgb_latents=rgb_latents).transpose(0, 3, 2, 1))
+            pred_images = torch.from_numpy(self.decode_latents(pred_latents, rgb_latents=rgb_latents).transpose(0, 3, 1, 2))
             pred_images = F.interpolate(pred_images,size=(self.image_size, self.image_size_2),mode='nearest')
             pred_images = pred_images.cpu().numpy().transpose(0, 2, 3, 1)
 
-            noisy_images = torch.from_numpy(self.decode_latents(noisy_latents, rgb_latents=rgb_latents).transpose(0, 3, 2, 1))
+            noisy_images = torch.from_numpy(self.decode_latents(noisy_latents, rgb_latents=rgb_latents).transpose(0, 3, 1, 2))
             noisy_images = F.interpolate(noisy_images,size=(self.image_size, self.image_size_2),mode='nearest')
             noisy_images = noisy_images.cpu().numpy().transpose(0, 2, 3, 1)
 
-            sanity_images = torch.from_numpy(self.decode_latents(original_latents, rgb_latents=rgb_latents).transpose(0, 3, 2, 1))
+            sanity_images = torch.from_numpy(self.decode_latents(original_latents, rgb_latents=rgb_latents).transpose(0, 3, 1, 2))
             sanity_images = F.interpolate(sanity_images,size=(self.image_size, self.image_size_2),mode='nearest')
             sanity_images = sanity_images.cpu().numpy().transpose(0, 2, 3, 1)
 
