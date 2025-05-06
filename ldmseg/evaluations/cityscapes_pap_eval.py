@@ -4,6 +4,7 @@ Cityscapes panoptic evaluator
 """
 
 import numpy as np
+from scipy import ndimage
 
 class CityscapesPanopticEvaluator:
     """
@@ -60,43 +61,65 @@ class CityscapesPanopticEvaluator:
         self.FN_per_class = {}
         self.iou_sum_per_class = {}
 
-    def add_image(self, pred_seg, gt_semseg, gt_instance=None):
+    def add_image(self, pred_seg, gt_semseg):
         """
         Parameters
         ----------
-        pred_seg      : (H,W) 预测的全景分割结果
-        gt_semseg     : (H,W) GT 语义标签
-        gt_instance   : (H,W) 或 None, GT 实例 ID (可选参数)
+        pred_seg      : (H,W) 预测的全景分割结果（实例分割）
+        gt_semseg     : (H,W) 真值语义分割标签
         """
-        # 如果没有提供gt_instance，创建一个简单的实例映射
-        if gt_instance is None:
-            gt_instance = np.zeros_like(gt_semseg)
-            # 为thing类别创建唯一实例ID
-            for sem_id in self.thing_ids:
-                if sem_id in np.unique(gt_semseg):
-                    # 为每个连通区域分配唯一ID
-                    mask = gt_semseg == sem_id
-                    from scipy import ndimage
-                    labeled, num_features = ndimage.label(mask)
-                    # 只在mask区域内使用labeled值
-                    gt_instance[mask] = labeled[mask]
-                    
-        # 构建GT的全景分割
+        # 将-1和ignore_label设为相同的值
+        pred_seg = pred_seg.copy()
+        pred_seg[pred_seg == -1] = self.ignore_label
+        
+        # 预处理真值：为thing类别生成实例ID
+        gt_instance = np.zeros_like(gt_semseg)
+        for thing_id in self.thing_ids:
+            thing_mask = gt_semseg == thing_id
+            if thing_mask.any():
+                # 为每个连通区域分配唯一ID
+                labeled, num_components = ndimage.label(thing_mask)
+                if num_components > 0:
+                    # 只在mask区域设置标签
+                    gt_instance[thing_mask] = labeled[thing_mask]
+
+        # 构建GT全景分割
         gt_pan = self._to_panoptic(gt_semseg, gt_instance)
         
-        # 从预测的全景分割中提取语义和实例信息
-        # 这里假设pred_seg已经包含全景分割结果，不需要再组合
-        pred_pan = pred_seg.copy()
-        pred_pan[gt_semseg == self.ignore_label] = -1  # 忽略区域不参与评估
-
-        # 枚举 GT 区域并匹配预测
-        gt_ids, pred_ids = np.unique(gt_pan), np.unique(pred_pan)
-        gt_ids   = gt_ids[  gt_ids != -1]
+        # 对预测分割进行处理：将不同的实例ID映射到唯一的全景ID
+        pred_pan = np.zeros_like(pred_seg)
+        for i, label in enumerate(np.unique(pred_seg)):
+            if label == self.ignore_label:
+                continue
+                
+            # 检查label的语义类别
+            if label in self.thing_ids:  # 对于thing类别，保持独立实例
+                instance_mask = pred_seg == label
+                components, num_components = ndimage.label(instance_mask)
+                
+                for j in range(1, num_components + 1):
+                    component_mask = components == j
+                    # 为每个连通区域分配唯一的panoptic ID
+                    pred_pan[component_mask] = label * self.max_ins + j
+            else:  # 对于stuff类别，直接使用语义标签
+                pred_pan[pred_seg == label] = label
+        
+        # 忽略区域不参与评估
+        pred_pan[gt_semseg == self.ignore_label] = -1
+        pred_pan[pred_seg == self.ignore_label] = -1
+        gt_pan[gt_semseg == self.ignore_label] = -1
+        
+        # 获取所有有效的GT和预测区域ID
+        gt_ids = np.unique(gt_pan)
+        pred_ids = np.unique(pred_pan)
+        gt_ids = gt_ids[gt_ids != -1]
         pred_ids = pred_ids[pred_ids != -1]
-
-        gt_masks   = {gid: gt_pan   == gid for gid in gt_ids}
+        
+        # 创建区域掩码
+        gt_masks = {gid: gt_pan == gid for gid in gt_ids}
         pred_masks = {pid: pred_pan == pid for pid in pred_ids}
-
+        
+        # 匹配过程
         matched_pred = set()
         for gid, gmask in gt_masks.items():
             # 获取语义类别
@@ -109,45 +132,46 @@ class CityscapesPanopticEvaluator:
                 self.FN_per_class[gcat] = 0
                 self.iou_sum_per_class[gcat] = 0.0
                 
+            # 寻找最佳匹配
             best_iou, best_pid = 0.0, None
             for pid, pmask in pred_masks.items():
                 pcat = (pid // self.max_ins) if pid >= self.max_ins else pid
-                if pcat != gcat:                       # 类别需一致
+                
+                # 类别必须一致才能匹配
+                if pcat != gcat:
                     continue
+                    
                 iou = self._iou(gmask, pmask)
                 if iou > best_iou:
                     best_iou, best_pid = iou, pid
             
+            # 如果IoU超过阈值，则认为是成功匹配
             if best_iou >= self.iou_thresh:
                 self.TP += 1
                 self.iou_sum += best_iou
                 matched_pred.add(best_pid)
                 
-                # 类别级别统计
+                # 更新类别级别统计
                 self.TP_per_class[gcat] += 1
                 self.iou_sum_per_class[gcat] += best_iou
-
-        self.FP += len(pred_masks) - len(matched_pred)
-        self.FN += len(gt_masks) - self.TP
+            else:
+                # 未匹配的GT区域计为FN
+                self.FN += 1
+                if gcat in self.FN_per_class:
+                    self.FN_per_class[gcat] += 1
+                else:
+                    self.FN_per_class[gcat] = 1
         
-        # 统计类别级别的 FP 和 FN
+        # 未匹配的预测区域计为FP
+        self.FP += len(pred_ids) - len(matched_pred)
+        
+        # 更新类别级别的FP
         for pid in pred_ids:
-            pcat = (pid // self.max_ins) if pid >= self.max_ins else pid
             if pid not in matched_pred:
+                pcat = (pid // self.max_ins) if pid >= self.max_ins else pid
                 if pcat not in self.FP_per_class:
                     self.FP_per_class[pcat] = 0
                 self.FP_per_class[pcat] += 1
-                
-        for gid in gt_ids:
-            gcat = (gid // self.max_ins) if gid >= self.max_ins else gid
-            if gcat not in self.FN_per_class:
-                self.FN_per_class[gcat] = 0
-            self.FN_per_class[gcat] += 1
-        
-        # 更正 FN 计数
-        for gcat in self.TP_per_class.keys():
-            if gcat in self.FN_per_class:
-                self.FN_per_class[gcat] -= self.TP_per_class[gcat]
 
     def evaluate(self):
         """
@@ -174,7 +198,8 @@ class CityscapesPanopticEvaluator:
                 cat_sq = cat_rq = cat_pq = 0.0
             else:
                 cat_sq = iou_sum / tp
-                cat_rq = tp / (tp + 0.5 * (fp + fn))
+                denom = tp + 0.5 * (fp + fn)
+                cat_rq = tp / denom if denom > 0 else 0.0
                 cat_pq = cat_sq * cat_rq
                 
             per_class[int(cat)] = {
@@ -219,12 +244,12 @@ class CityscapesPanopticEvaluator:
             'tp': self.TP, 'fp': self.FP, 'fn': self.FN,
             'iou_sum': self.iou_sum,
             'per_class': per_class,
-            'thing_pq': thing_pq, 'thing_sq': thing_sq, 'thing_rq': thing_rq,
-            'stuff_pq': stuff_pq, 'stuff_sq': stuff_sq, 'stuff_rq': stuff_rq
+            'thing_pq': thing_pq*100, 'thing_sq': thing_sq*100, 'thing_rq': thing_rq*100,
+            'stuff_pq': stuff_pq*100, 'stuff_sq': stuff_sq*100, 'stuff_rq': stuff_rq*100
         }
 
 
-def compute_cityscapes_pq(panoptic_pred, gt_semantic, gt_instance=None, thing_ids=None, count_th=100, mask_th=0.5, overlap_th=0.5, max_ins=32000):
+def compute_cityscapes_pq(panoptic_pred, gt_semantic, thing_ids=None, count_th=100, mask_th=0.5, overlap_th=0.5, max_ins=32000):
     """
     计算 Cityscapes 的 Panoptic Quality 指标
     
@@ -234,8 +259,6 @@ def compute_cityscapes_pq(panoptic_pred, gt_semantic, gt_instance=None, thing_id
         预测的全景分割结果, shape=(H,W), 包含从0到N-1的整数ID
     gt_semantic : numpy.ndarray
         真实的语义分割标签图, shape=(H,W)
-    gt_instance : numpy.ndarray 或 None
-        真实的实例分割标签图, shape=(H,W), 可选参数
     thing_ids : set 或 None
         需要区分实例的类别ID集合，默认为 Cityscapes 的 things 类别
     count_th : int
@@ -264,6 +287,6 @@ def compute_cityscapes_pq(panoptic_pred, gt_semantic, gt_instance=None, thing_id
     
     # 创建评估器并计算指标
     evaluator = CityscapesPanopticEvaluator(thing_ids=thing_ids)
-    evaluator.add_image(cleaned_pred, gt_semantic, gt_instance)
+    evaluator.add_image(cleaned_pred, gt_semantic)
     
     return evaluator.evaluate() 

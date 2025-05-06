@@ -59,7 +59,7 @@ class Cityscapes(data.Dataset):
         inpaint_mask_size: Optional[Tuple[int]] = None,
         num_classes: int = 128,
         fill_value: int = 0.5,
-        ignore_label: int = 0,
+        ignore_label: int = 127,
         inpainting_strength: float = 0.0,
     ):
         """

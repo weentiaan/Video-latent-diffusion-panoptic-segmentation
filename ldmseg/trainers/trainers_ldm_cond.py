@@ -1180,6 +1180,7 @@ class TrainerDiffusion(DatasetBase):
         prediction = prediction[:, y_min:y_max + 1, x_min:x_max + 1]
         return prediction
     # -*- coding: utf-8 -*-
+    
     @torch.no_grad()
     def compute_pq(
         self,
@@ -1194,18 +1195,20 @@ class TrainerDiffusion(DatasetBase):
         save_model: bool = False,
     ):
         """
-        Computes the panoptic quality metric on the validation set
-        Currently only class agnostic evaluation is supported
+        Computes the panoptic quality metric on the validation set for Cityscapes dataset
         """
 
-        #from ldmseg.evaluations import PanopticEvaluatorAgnostic
-        from ldmseg.evaluations.new_eval import eval,vpq_eval
-        print('Computing PQ metric ...')
+        from ldmseg.evaluations.cityscapes_pap_eval import CityscapesPanopticEvaluator
+        print('Computing PQ metric for Cityscapes ...')
 
         if dataloader is None:
             dataloader = self.dl_val
 
-        
+        meta_data = dataloader.dataset.meta_data
+        # Cityscapes thing classes IDs (person, rider, car, truck, bus, train, motorcycle, bicycle)
+        thing_ids = {11, 12, 13, 14, 15, 16, 17, 18}
+        evaluator = CityscapesPanopticEvaluator(thing_ids=thing_ids)
+        evaluator.reset()
 
         # handle noise scheduler
         scheduler = self.noise_scheduler
@@ -1215,20 +1218,27 @@ class TrainerDiffusion(DatasetBase):
 
         if max_iter is not None:
             print('Running PQ eval on subset percentage {}/{} ...'.format(max_iter, len(dataloader)))
-        results=[]
+
         for batch_idx, data in tqdm(enumerate(dataloader)):
-            
-            h, w = 192,640
+            file_names = [x["image_file"] for x in data['meta']]
+            image_ids = [x["image_id"] for x in data['meta']]
+            h, w = [x["im_size"][0] for x in data['meta']], [x["im_size"][1] for x in data['meta']]
             rgb_images = data['image'].to(self.args['gpu'], non_blocking=True)
             padding_masks = data['mask'].cuda(self.args['gpu'], non_blocking=True)
             text = data['text']
+            
+            # Ground truth segmentation
+            gt_semseg = data['semseg'].cuda(self.args['gpu'], non_blocking=True)
 
+            # Get RGB latents
             rgb_latents, _ = self.encode_inputs(
                 rgb_images,
                 encode_func=self.vae_image.encode,
                 scaling_factor=self.vae_image.scaling_factor,
                 resize=self.rgb_size,
             )
+            
+            # Generate segmentation latents
             semseg_latents = self.sample(
                 text,
                 num_inference_steps,
@@ -1240,15 +1250,17 @@ class TrainerDiffusion(DatasetBase):
                 scheduler=scheduler,
                 disable_progress_bar=True,
             )
+            
+            # Decode latents to get mask logits
             masks_logits = self.decode_latents(
                 semseg_latents,
                 return_logits=True,
                 threshold_output=False,
                 rgb_latents=rgb_latents,
                 weight_dtype=torch.float32,
-            )#预测值
+            )
 
-            # upsample masks to input size
+            # Upsample masks to input size
             masks_logits = F.interpolate(
                 masks_logits,
                 size=(rgb_images.shape[-2], rgb_images.shape[-1]),
@@ -1256,44 +1268,74 @@ class TrainerDiffusion(DatasetBase):
                 align_corners=False,
             )
 
-            # postprocess masks
+            # Process each image in the batch and store for visualization
             processed_results = []
             
             for image_idx, mask_pred_result in enumerate(masks_logits):
-
-                # crop mask to get rid of padding
+                # Crop mask to get rid of padding
                 mask_pred_result = self.crop_padding(mask_pred_result, padding_masks[image_idx])
 
-                # interpolate to original size
+                # Interpolate to original size
                 mask_pred_result = F.interpolate(
                     mask_pred_result[None, ...].float(),  # [1, C, H, W]
-                    size=(h, w),
+                    size=(h[image_idx], w[image_idx]),
                     mode="bilinear",
                     align_corners=False
                 )[0]  # [C, H, W]
 
-                # get panoptic prediction
+                # Get panoptic prediction
                 panoptic_pred = torch.argmax(mask_pred_result, dim=0)
                 if threshold_output:
                     probs = F.softmax(mask_pred_result, dim=0)
-                    topk = torch.topk(probs, k=2, dim=0)
                     if threshold_mode == 'topk_diff':
                         topk = torch.topk(probs, k=2, dim=0)
                         probs = topk.values[0] - topk.values[1]
                     else:
                         probs = probs.max(dim=0)[0]
-                    panoptic_pred[probs < self.mask_th] = -1
+                    panoptic_pred[probs < self.mask_th] = self.ds.ignore_label
 
-                # move to cpu (to save gpu memory during training)
+                # Move to CPU and convert to numpy
                 panoptic_pred = panoptic_pred.cpu().numpy()
                 mask_pred_result = F.sigmoid(mask_pred_result)
                 mask_pred_result = mask_pred_result.cpu().numpy()
 
-                processed_results.append(panoptic_pred)   
-                element=(panoptic_pred,data['semseg'][image_idx],data['instance'][image_idx],data['depth'][image_idx],data['depth'][image_idx])
-                results.append(eval(element))
-            
-            
+                # Create a working copy for processing
+                cleaned_pred = panoptic_pred.copy()
+                
+                # Process segments
+                segments_info = []
+                for panoptic_label, count_i in zip(*np.unique(panoptic_pred, return_counts=True)):
+                    # Skip small segments and ignore label
+                    if count_i < self.count_th or panoptic_label in {-1, self.ds.ignore_label}:
+                        cleaned_pred[cleaned_pred == panoptic_label] = -1
+                        continue
+
+                    # Check overlap between argmax and thresholded mask
+                    original_mask = mask_pred_result[panoptic_label] >= self.mask_th
+                    if (panoptic_pred == panoptic_label).sum() / original_mask.sum() < self.overlap_th:
+                        cleaned_pred[cleaned_pred == panoptic_label] = -1
+                        continue
+
+                    segments_info.append(
+                        {
+                            "id": int(panoptic_label) + 1,
+                            "category_id": 1,  # Class agnostic 
+                            "isthing": True,
+                        }
+                    )
+                
+                # Store for visualization
+                processed_results.append({
+                    "panoptic_seg": (cleaned_pred + 1, segments_info)
+                })
+                
+                # Get ground truth semantic segmentation
+                gt_semantic = gt_semseg[image_idx].cpu().numpy()
+                
+                # Add to evaluator - CityscapesPanopticEvaluator expects: pred_seg, gt_semseg
+                evaluator.add_image(cleaned_pred, gt_semantic)
+
+            # Visualize if needed
             if is_main_process() and save_images and batch_idx == 0:
                 
                 self.log_images_val(
@@ -1302,210 +1344,35 @@ class TrainerDiffusion(DatasetBase):
                     gt_images=data['semseg'],
                     rgb_latents=rgb_latents,
                     inpainting_masks=None,
+                    additional_images=None,
                 )
 
             if max_iter is not None and batch_idx > max_iter:
                 break
 
-        iou_per_class = np.stack([result[0] for result in results]).sum(axis=0)
-        tp_per_class = np.stack([result[1] for result in results]).sum(axis=0)
-        fn_per_class = np.stack([result[2] for result in results]).sum(axis=0)
-        fp_per_class = np.stack([result[3] for result in results]).sum(axis=0)
-        abs_rel = np.stack([result[4] for result in results]).mean(axis=0)
-        epsilon = 1e-10
-        iou_per_class = iou_per_class[:19]
-        tp_per_class = tp_per_class[:19]
-        fn_per_class = fn_per_class[:19]
-        fp_per_class = fp_per_class[:19]
-        sq = iou_per_class / (tp_per_class + epsilon)
-        rq = tp_per_class / (tp_per_class + 0.5 *
-                            fn_per_class + 0.5 * fp_per_class + epsilon)
-        pq = sq * rq
-        spq = pq[8:]
-        tpq = pq[:8]
-        print(
-            r'{:.1f} {:.1f} {:.1f}'.format(
-                pq.mean() * 100,
-                tpq.mean() * 100,
-                spq.mean() * 100))
+        # Get evaluation results
+        results = evaluator.evaluate()
+        
+        # Print PQ metrics
+        if is_main_process():
+            print(f"Panoptic Quality (PQ): {results['pq']:.2f}")
+            print(f"Segmentation Quality (SQ): {results['sq']:.2f}")
+            print(f"Recognition Quality (RQ): {results['rq']:.2f}")
+            if 'thing_pq' in results:
+                print(f"Things PQ: {results['thing_pq']:.2f}")
+                print(f"Stuff PQ: {results['stuff_pq']:.2f}")
 
+        # Save best model if needed
         if is_main_process() and save_model:
-            if pq.mean() > self.best_pq:
-                self.best_pq = pq.mean()
+            if results["pq"] > self.best_pq:
+                self.best_pq = results["pq"]
                 print(f'Saving best model with PQ of {self.best_pq} ...')
                 epoch_id = self.epoch if hasattr(self, 'epoch') else None
                 data = self.construct_save_dict(epoch=epoch_id)
                 data['PQ'] = self.best_pq
                 torch.save(data, str(self.results_folder / 'best_model.pt'))
 
-        return
-    # @torch.no_grad()
-    # def compute_pq(
-    #     self,
-    #     num_inference_steps: int = 50,
-    #     guidance_scale: float = 7.5,
-    #     seed: Optional[int] = None,
-    #     threshold_output: bool = True,
-    #     save_images: bool = False,
-    #     max_iter: Optional[int] = None,
-    #     dataloader: Optional[DataLoader] = None,
-    #     threshold_mode: str = 'max',
-    #     save_model: bool = False,
-    # ):
-    #     """
-    #     Computes the panoptic quality metric on the validation set
-    #     Currently only class agnostic evaluation is supported
-    #     """
-
-    #     from ldmseg.evaluations import PanopticEvaluatorAgnostic
-
-    #     print('Computing PQ metric ...')
-
-    #     if dataloader is None:
-    #         dataloader = self.dl_val
-
-    #     meta_data = dataloader.dataset.meta_data
-    #     evaluator = PanopticEvaluatorAgnostic(meta=meta_data)
-    #     evaluator.reset()
-
-    #     # handle noise scheduler
-    #     scheduler = self.noise_scheduler
-    #     scheduler.set_timesteps_inference(num_inference_steps=num_inference_steps)
-    #     scheduler.move_timesteps_to(self.args['gpu'])
-    #     print(f'Setting noise schedule for eval mode with timesteps {scheduler.timesteps.tolist()} ... ')
-
-    #     if max_iter is not None:
-    #         print('Running PQ eval on subset percentage {}/{} ...'.format(max_iter, len(dataloader)))
-
-    #     for batch_idx, data in tqdm(enumerate(dataloader)):
-    #         file_names = [x["image_file"] for x in data['meta']]
-    #         image_ids = [x["image_id"] for x in data['meta']]
-    #         h, w = [x["im_size"][0] for x in data['meta']], [x["im_size"][1] for x in data['meta']]
-    #         rgb_images = data['image'].to(self.args['gpu'], non_blocking=True)
-    #         padding_masks = data['mask'].cuda(self.args['gpu'], non_blocking=True)
-    #         text = data['text']
-
-    #         rgb_latents, _ = self.encode_inputs(
-    #             rgb_images,
-    #             encode_func=self.vae_image.encode,
-    #             scaling_factor=self.vae_image.scaling_factor,
-    #             resize=self.rgb_size,
-    #         )
-    #         semseg_latents = self.sample(
-    #             text,
-    #             num_inference_steps,
-    #             guidance_scale,
-    #             seed,
-    #             rgb_latents=rgb_latents,
-    #             return_all_latents=False,
-    #             rgb_images=rgb_images,
-    #             scheduler=scheduler,
-    #             disable_progress_bar=True,
-    #         )
-    #         masks_logits = self.decode_latents(
-    #             semseg_latents,
-    #             return_logits=True,
-    #             threshold_output=False,
-    #             rgb_latents=rgb_latents,
-    #             weight_dtype=torch.float32,
-    #         )
-
-    #         # upsample masks to input size
-    #         masks_logits = F.interpolate(
-    #             masks_logits,
-    #             size=(rgb_images.shape[-2], rgb_images.shape[-1]),
-    #             mode="bilinear",
-    #             align_corners=False,
-    #         )
-
-    #         # postprocess masks
-    #         processed_results = []
-    #         for image_idx, mask_pred_result in enumerate(masks_logits):
-
-    #             # crop mask to get rid of padding
-    #             mask_pred_result = self.crop_padding(mask_pred_result, padding_masks[image_idx])
-
-    #             # interpolate to original size
-    #             mask_pred_result = F.interpolate(
-    #                 mask_pred_result[None, ...].float(),  # [1, C, H, W]
-    #                 size=(h[image_idx], w[image_idx]),
-    #                 mode="bilinear",
-    #                 align_corners=False
-    #             )[0]  # [C, H, W]
-
-    #             # get panoptic prediction
-    #             panoptic_pred = torch.argmax(mask_pred_result, dim=0)
-    #             if threshold_output:
-    #                 probs = F.softmax(mask_pred_result, dim=0)
-    #                 topk = torch.topk(probs, k=2, dim=0)
-    #                 if threshold_mode == 'topk_diff':
-    #                     topk = torch.topk(probs, k=2, dim=0)
-    #                     probs = topk.values[0] - topk.values[1]
-    #                 else:
-    #                     probs = probs.max(dim=0)[0]
-    #                 panoptic_pred[probs < self.mask_th] = -1
-
-    #             # move to cpu (to save gpu memory during training)
-    #             panoptic_pred = panoptic_pred.cpu().numpy()
-    #             mask_pred_result = F.sigmoid(mask_pred_result)
-    #             mask_pred_result = mask_pred_result.cpu().numpy()
-
-    #             processed_results.append({})
-    #             segments_info = []
-    #             for panoptic_label, count_i in zip(*np.unique(panoptic_pred, return_counts=True)):
-
-    #                 # set small segments to void label (later we add 1 to get 0 for void class)
-    #                 if count_i < self.count_th or panoptic_label in {-1, dataloader.dataset.ignore_label}:
-    #                     panoptic_pred[panoptic_pred == panoptic_label] = -1
-    #                     continue
-
-    #                 # (optional) also enforce overlap between argmax and thresholded mask
-    #                 original_mask = mask_pred_result[panoptic_label] >= self.mask_th
-    #                 if (panoptic_pred == panoptic_label).sum() / original_mask.sum() < self.overlap_th:
-    #                     panoptic_pred[panoptic_pred == panoptic_label] = -1
-    #                     continue
-
-    #                 segments_info.append(
-    #                     {
-    #                         "id": int(panoptic_label) + 1,
-    #                         "category_id": 1,
-    #                         "isthing": True,
-    #                     }
-    #                 )
-    #             processed_results[-1]["panoptic_seg"] = panoptic_pred + 1, segments_info
-
-    #         evaluator.process(file_names, image_ids, processed_results)
-
-    #         if is_main_process() and save_images and batch_idx == 0:
-    #             image_overlayed = self.overlay_predictions(
-    #                 file_names=file_names,
-    #                 processed_results=processed_results,
-    #                 meta_data=meta_data,
-    #             )
-    #             self.log_images_val(
-    #                 latents=semseg_latents,
-    #                 rgb_images=rgb_images,
-    #                 gt_images=data['semseg'],
-    #                 rgb_latents=rgb_latents,
-    #                 inpainting_masks=None,
-    #                 additional_images=[image_overlayed],
-    #             )
-
-    #         if max_iter is not None and batch_idx > max_iter:
-    #             break
-
-    #     results = evaluator.evaluate()
-
-    #     if is_main_process() and save_model:
-    #         if results["panoptic_seg"]["PQ"] > self.best_pq:
-    #             self.best_pq = results["panoptic_seg"]["PQ"]
-    #             print(f'Saving best model with PQ of {self.best_pq} ...')
-    #             epoch_id = self.epoch if hasattr(self, 'epoch') else None
-    #             data = self.construct_save_dict(epoch=epoch_id)
-    #             data['PQ'] = self.best_pq
-    #             torch.save(data, str(self.results_folder / 'best_model.pt'))
-
-    #     return
+        return 
 
     @torch.no_grad()
     def log_images_val(
@@ -1521,19 +1388,14 @@ class TrainerDiffusion(DatasetBase):
 
         """ Write example predictions to disk
         """
-        
-        images =torch.from_numpy(self.decode_latents(latents, rgb_latents=rgb_latents, weight_dtype=torch.float32).transpose(0,3,1,2))
-        
-        images = F.interpolate(
-                images,
-                size=(rgb_images.shape[-2], rgb_images.shape[-1]),
-                mode="bilinear",
-                align_corners=False,
-            ).cpu().numpy().transpose(0,2,3,1)
+
+        images = torch.from_numpy(self.decode_latents(latents, rgb_latents=rgb_latents, weight_dtype=torch.float32).transpose(0, 3, 2, 1))
+        images = F.interpolate(images,size=(self.image_size, self.image_size_2),mode='nearest')
+        images = images.cpu().numpy().transpose(0, 2, 3, 1)
+
         rgb_images = (255 * rgb_images).cpu().numpy().transpose(0, 2, 3, 1)
         gt_images = self.encode_seg(gt_images.cpu().numpy()).astype(np.uint8)
-        
-        
+
         # TODO clean this up by adding it to additonal images list
         if inpainting_masks is not None:
             inpainting_masks = F.interpolate(inpainting_masks.float()[:, None],
@@ -1548,26 +1410,25 @@ class TrainerDiffusion(DatasetBase):
 
         nimgs = self.batch_size_val
         size = self.image_size
-        size2=self.image_size_2
+        size_2 = self.image_size_2
         offset = int(0.02 * size)
-        rgb_array = np.zeros((size, nimgs * (size2 + offset), 3), dtype=np.uint8)
-        gt_array = np.zeros((size, nimgs * (size2 + offset), 3), dtype=np.uint8)
-        gen_array = np.zeros((size, nimgs * (size2 + offset), 3), dtype=np.uint8)
-        inpaint_array = np.zeros((size, nimgs * (size2 + offset), 3), dtype=np.uint8)
+        rgb_array = np.zeros((size, nimgs * (size_2 + offset), 3), dtype=np.uint8)
+        gt_array = np.zeros((size, nimgs * (size_2 + offset), 3), dtype=np.uint8)
+        gen_array = np.zeros((size, nimgs * (size_2 + offset), 3), dtype=np.uint8)
+        inpaint_array = np.zeros((size, nimgs * (size_2 + offset), 3), dtype=np.uint8)
         ptr = 0
-        
         for idx, (rgb, gt, gen_image, inpaint_image) in enumerate(zip(
             rgb_images[:nimgs],
             gt_images[:nimgs],
             images[:nimgs],
             inpainting_masks[:nimgs],
         )):
-
-            rgb_array[:, ptr:ptr + size2, :] = rgb
-            gt_array[:, ptr:ptr + size2, :] = gt
-            gen_array[:, ptr:ptr + size2, :] = gen_image
-            inpaint_array[:, ptr:ptr + size2, :] = inpaint_image
-            ptr += size2 + offset
+            
+            rgb_array[:, ptr:ptr + size_2, :] = rgb
+            gt_array[:, ptr:ptr + size_2, :] = gt
+            gen_array[:, ptr:ptr + size_2, :] = gen_image
+            inpaint_array[:, ptr:ptr + size_2, :] = inpaint_image
+            ptr += size_2 + offset
 
         stacked_images = [rgb_array, gt_array, gen_array]
         if add_inpainting:
@@ -1613,8 +1474,10 @@ class TrainerDiffusion(DatasetBase):
             scheduler=scheduler,
         )
 
-        images =self.decode_latents(latents, rgb_latents=rgb_latents, weight_dtype=torch.float32)
-        
+        images = torch.from_numpy(self.decode_latents(latents, rgb_latents=rgb_latents, weight_dtype=torch.float32).transpose(0, 3, 2, 1))
+        images = F.interpolate(images,size=(self.image_size, self.image_size_2),mode='nearest')
+        images = images.cpu().numpy().transpose(0, 2, 3, 1)
+
         if self.use_wandb:
             timesteps = timesteps.cpu().numpy()
             if 'images' not in log_dict:
@@ -1649,17 +1512,25 @@ class TrainerDiffusion(DatasetBase):
             )
 
         else:
-            nimgs = self.batch_size_val
 
-            pred_images = self.decode_latents(pred_latents, rgb_latents=rgb_latents)
-            noisy_images = self.decode_latents(noisy_latents, rgb_latents=rgb_latents)
-            sanity_images = self.decode_latents(original_latents, rgb_latents=rgb_latents)
+            nimgs = self.batch_size_val
+            pred_images = torch.from_numpy(self.decode_latents(pred_latents, rgb_latents=rgb_latents).transpose(0, 3, 2, 1))
+            pred_images = F.interpolate(pred_images,size=(self.image_size, self.image_size_2),mode='nearest')
+            pred_images = pred_images.cpu().numpy().transpose(0, 2, 3, 1)
+
+            noisy_images = torch.from_numpy(self.decode_latents(noisy_latents, rgb_latents=rgb_latents).transpose(0, 3, 2, 1))
+            noisy_images = F.interpolate(noisy_images,size=(self.image_size, self.image_size_2),mode='nearest')
+            noisy_images = noisy_images.cpu().numpy().transpose(0, 2, 3, 1)
+
+            sanity_images = torch.from_numpy(self.decode_latents(original_latents, rgb_latents=rgb_latents).transpose(0, 3, 2, 1))
+            sanity_images = F.interpolate(sanity_images,size=(self.image_size, self.image_size_2),mode='nearest')
+            sanity_images = sanity_images.cpu().numpy().transpose(0, 2, 3, 1)
 
             rgb_images = (255 * rgb_images).cpu().numpy().transpose(0, 2, 3, 1)
             gt_images = self.encode_seg(gt_images.cpu().numpy()).astype(np.uint8)
             if inpainting_masks is not None:
                 inpainting_masks = F.interpolate(inpainting_masks.float()[:, None],
-                                                 size=(self.image_size, self.size),
+                                                 size=(self.image_size, self.image_size),
                                                  mode='nearest')
                 inpainting_masks = (255 * inpainting_masks.repeat(1, 3, 1, 1))
                 inpainting_masks = inpainting_masks.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
@@ -1667,38 +1538,7 @@ class TrainerDiffusion(DatasetBase):
             else:
                 inpainting_masks = np.zeros_like(gt_images)
                 add_inpainting = False
-            #print(pred_images.shape,rgb_images.shape,gt_images.shape,noisy_images.shape,sanity_images.shape,images.shape,inpainting_masks.shape)
-            pred_images = torch.from_numpy(pred_images).permute(0,3,1,2)
-            noisy_images = torch.from_numpy(noisy_images).permute(0,3,1,2)
-            sanity_images = torch.from_numpy(sanity_images).permute(0,3,1,2)
-            images = torch.from_numpy(images).permute(0,3,1,2)
 
-            pred_images = F.interpolate(
-                pred_images,
-                size=(192, 640),
-                mode="nearest",
-            ).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-
-            noisy_images = F.interpolate(
-                noisy_images,
-                size=(192, 640),
-                mode="bilinear",
-                align_corners=False,
-            ).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-
-            sanity_images = F.interpolate(
-                sanity_images,
-                size=(192, 640),
-                mode="bilinear",
-                align_corners=False,
-            ).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-
-            images = F.interpolate(
-                images,
-                size=(192, 640),
-                mode="nearest",
-            ).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-            #print(pred_images.shape,rgb_images.shape,gt_images.shape,noisy_images.shape,sanity_images.shape,images.shape,inpainting_masks.shape)
             ptr = 0
             size = self.image_size
             size_2 = self.image_size_2
@@ -1728,15 +1568,19 @@ class TrainerDiffusion(DatasetBase):
                 gen_array[:, ptr:ptr + size_2, :] = gen_image
                 inpaint_array[:, ptr:ptr + size_2, :] = inpaint_image
                 ptr += size_2 + offset
-                
+
             stacked_images = [rgb_array, gt_array, sanity_array, noisy_array, pred_array, gen_array]
             if add_inpainting:
                 stacked_images.append(inpaint_array)
+            
             import datetime
- 
+            
+            # 打印当前时间
+            
+            # 打印按指定格式排版的时间
+            time1 = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
 
-            time1 = datetime.datetime.now()
-            self.write_images(np.vstack(stacked_images), str(time1)+'all.png')
+            self.write_images(np.vstack(stacked_images), str(time1) + '_all.png')
 
             print(f'saved predictions during train with timesteps {timesteps.cpu().tolist()}')
 

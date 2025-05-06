@@ -4,6 +4,6 @@ val_db_name: cityscapes
 split: 'train'
 num_classes: 128 # max 128 intances in panoptic segmentation
 has_bg: False
-ignore_label: 0
+ignore_label: 127
 fill_value: 0.5
 inpainting_strength: 0.0

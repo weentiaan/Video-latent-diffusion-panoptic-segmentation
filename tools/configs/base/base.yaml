@@ -80,10 +80,10 @@ train_kwargs:
    sample_posterior: False
    sample_posterior_rgb: False
    remap_seg: True
-   train_num_steps: 10
-   batch_size: 4
+   train_num_steps: 24000
+   batch_size: 8
    accumulate: 1
-   num_workers: 4
+   num_workers: 8
    loss: l2
    ohem_ratio: 1.
    cudnn: False
@@ -127,8 +127,8 @@ eval_kwargs:
    overlap_th: 0.5
    batch_size: 16
    num_workers: 2
-   vis_every: 2000
-   print_freq: 100
+   vis_every: 1500
+   print_freq: 20
 
 # Optimizer
 optimizer_name: adamw
@@ -172,12 +172,14 @@ transformation_kwargs:
       std: [0.229, 0.224, 0.225]
 
 # dataset information: will be overwritten by the dataset config
-train_db_name:
-val_db_name:
+
+# dataset information: will be overwritten by the dataset config
+train_db_name:cityscapes
+val_db_name:cityscapes
 split: 'val'
 num_classes: 128   # max number of instances we can detect
-num_bits: 10        # if we want to detect 128 instances, we need 7 bits
+num_bits: 16        # if we want to detect 128 instances, we need 7 bits
 has_bg: False
-ignore_label: 0
+ignore_label: 127
 fill_value: 0.5
 inpainting_strength: 0.0
